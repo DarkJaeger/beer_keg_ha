@@ -1,8 +1,8 @@
 {
   "domain": "beer_keg",
   "name": "Beer Keg Scale",
-  "version": "2.1.2",
-  "documentation": "https://github.com/DarkJaeger/beer_keg.git",
+  "version": "1.1.2",
+  "documentation": "https://github.com/DarkJaeger/beer-keg-ha.git",
   "requirements": [],
   "codeowners": ["@DarkJaeger"],
   "iot_class": "local_push",
