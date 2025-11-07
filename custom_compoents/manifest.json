@@ -1,5 +1,5 @@
 {
-  "domain": "beer_keg",
+  "domain": "beer-keg-ha",
   "name": "Beer Keg Scale",
   "version": "1.0.0",
   "documentation": "https://github.com/DarkJaeger/beer-keg-ha",
