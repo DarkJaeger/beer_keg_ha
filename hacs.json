@@ -1,6 +1,6 @@
 {
   "name": "Beer Keg Scale",
-  "domain": "beer_keg_ha",
+  "domains": "beer_keg_ha",
   "country": "US",
   "render_readme": true,
   "homeassistant": "2024.6.0",

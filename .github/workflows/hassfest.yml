@@ -12,10 +12,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Validate manifest + translations + config structure
       - name: Hassfest validation
         uses: home-assistant/actions/hassfest@master
 
-      # Validate HACS metadata (hacs.json)
       - name: HACS validation
         uses: hacs/action@22.5.0
+        with:
+          category: integration
