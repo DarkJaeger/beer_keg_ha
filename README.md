@@ -1,25 +1,72 @@
-What it does (keg weight, temp, fill %, pour detection, oz/kg choice).
+\# Beer Keg Scale (Home Assistant)
 
-Requirements (a running server with /ws and /api/kegs).
 
-Install via HACS (preferred):
 
-HACS → Integrations → 3-dot menu → Custom repositories → Add your repo URL as type Integration.
+Live keg weight, temperature, fill %, pours, and history — with WebSocket + REST fallback. Supports density-aware fill% using Full Volume (L) and Beer SG.
 
-Search “Beer Keg Scale” → Install.
 
-Restart HA → Settings → Devices & Services → Add Integration → “Beer Keg Scale”.
 
-Manual install:
+\## Install (HACS - Custom repo)
 
-Download the latest Release ZIP.
+1\. HACS → Integrations → 3-dot menu → \*\*Custom repositories\*\*
 
-Extract to /config/custom_components/beer_keg/.
+2\. Add: `https://github.com/DarkJaeger/bee-keg-ha` as type \*\*Integration\*\*
 
-Restart HA → Add Integration.
+3\. Search “Beer Keg Scale” → Install → \*\*Restart Home Assistant\*\*
 
-Configuration instructions (WS URL, options).
+4\. Settings → Devices \& Services → \*\*Add Integration\*\* → Beer Keg Scale
 
-Services (beer_keg.export_history, beer_keg.refresh_kegs).
 
-Troubleshooting (logs, event listening).
+
+\## Configure
+
+\- \*\*WebSocket URL\*\*: `ws://<host>:8085/ws`
+
+\- Options:
+
+&nbsp; - Empty keg weight (kg): `0` if you tare with empty keg
+
+&nbsp; - Full volume (L): e.g. `19.0`
+
+&nbsp; - Beer SG: e.g. `1.010` (defaults to typical finished beer)
+
+&nbsp; - Default full weight (kg): fallback if needed
+
+&nbsp; - Per-keg full weights JSON: `{ "keg\_id": 19.0 }`
+
+
+
+\## Entities
+
+\- `sensor.keg\_<id>\_weight` (kg)
+
+\- `sensor.keg\_<id>\_temperature` (°C)
+
+\- `sensor.keg\_<id>\_fill\_percent` (and legacy alias `\_fill\_level`)
+
+\- `sensor.keg\_<id>\_last\_pour` (oz)
+
+\- `sensor.keg\_<id>\_daily\_consumed` (oz)
+
+\- `sensor.keg\_<id>\_full\_weight` (kg)
+
+\- `sensor.keg\_<id>\_name`, `sensor.keg\_<id>\_id`
+
+
+
+\## Services
+
+\- `beer\_keg\_ha.export\_history`
+
+\- `beer\_keg\_ha.refresh\_kegs`
+
+
+
+\## Notes
+
+\- WS for realtime, REST poll + watchdog for resilience.
+
+\- Fill% chooses full\_weight: device → per-keg override → `volume × SG × 0.998` → default.
+
+
+
