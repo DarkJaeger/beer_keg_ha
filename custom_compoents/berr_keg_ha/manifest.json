@@ -1,11 +1,11 @@
 {
-  "domain": "beer-keg-ha",
+  "domain": "beer_keg_ha",
   "name": "Beer Keg Scale",
   "version": "1.0.0",
   "documentation": "https://github.com/DarkJaeger/beer-keg-ha",
   "issue_tracker": "https://github.com/DarkJaeger/beer-keg-ha/issues",
   "iot_class": "local_push",
-  "codeowners": ["@<DarkJaeger>"],
+  "codeowners": ["@DarkJaeger"],
   "config_flow": true,
-  "loggers": ["custom_components.beer_keg"]
+  "loggers": ["custom_components.beer_keg_ha"]
 }
