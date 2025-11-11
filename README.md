@@ -10,7 +10,7 @@ Live keg weight, temperature, fill %, pours, and history — with WebSocket + RE
 
 1\. HACS → Integrations → 3-dot menu → \*\*Custom repositories\*\*
 
-2\. Add: `https://github.com/DarkJaeger/bee-keg-ha` as type \*\*Integration\*\*
+2\. Add: `https://github.com/DarkJaeger/beer-keg-ha` as type \*\*Integration\*\*
 
 3\. Search “Beer Keg Scale” → Install → \*\*Restart Home Assistant\*\*
 
