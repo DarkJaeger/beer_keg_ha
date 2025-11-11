@@ -68,5 +68,17 @@ Live keg weight, temperature, fill %, pours, and history — with WebSocket + RE
 
 \- Fill% chooses full\_weight: device → per-keg override → `volume × SG × 0.998` → default.
 
+\Trouble shooting
 
+\Clear HACS cache before retry
+
+\In Home Assistant:
+
+1.\HACS → ⋯ menu → Clear downloads
+
+2.\HACS → ⋯ menu → Reload data
+
+3.\If still cached: restart Home Assistant
+
+4.\Try the install again
 
