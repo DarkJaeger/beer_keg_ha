@@ -4,3 +4,52 @@ export_history:
 refresh_kegs:
   name: Refresh kegs
   description: Fetch /api/kegs and merge into Home Assistant
+calibrate_keg:
+  name: Calibrate Keg
+  description: Send calibration to keg server (/api/kegs/calibrate)
+  fields:
+    id:
+      required: true
+      selector:
+        text:
+    name:
+      required: true
+      selector:
+        text:
+    full_weight:
+      required: true
+      selector:
+        number:
+          min: 0
+          step: 0.01
+    weight_calibrate:
+      required: true
+      selector:
+        number:
+          min: -10
+          step: 0.01
+    temperature_calibrate:
+      required: true
+      selector:
+        number:
+          min: -10
+          step: 0.1
+
+set_display_units:
+  name: Set Display Units
+  description: Set dashboard display preferences for weight/temperature
+  fields:
+    weight_unit:
+      required: true
+      selector:
+        select:
+          options:
+            - kg
+            - lb
+    temp_unit:
+      required: true
+      selector:
+        select:
+          options:
+            - °C
+            - °F

@@ -40,6 +40,11 @@ REST_POLL_SECONDS = 10
 WS_PING_SEC = 30
 DATA_STALE_SEC = 45
 LAST_UPDATE_KEY = "last_update_ts"
+# near top
+PLATFORMS = ["sensor", "select"]  # add select
+
+DEVICES_UPDATE_EVENT = f"{DOMAIN}_devices_update"
+DEVICES_REFRESH_SEC = 60
 
 # Optional density defaults (guarded in case not present in const.py)
 try:
@@ -175,6 +180,60 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             except Exception as e:
                 _LOGGER.error("%s: fetch_kegs error (outer): %s", DOMAIN, e)
                 return []
+        async def fetch_devices() -> list[str]:
+            """GET /api/kegs/devices -> list of IDs."""
+            try:
+                u = urlparse(ws_url)
+                scheme = "http" if u.scheme == "ws" else "https" if u.scheme == "wss" else "http"
+                base = urlunparse((scheme, u.netloc, "", "", "", ""))
+                urls = (f"{base}/api/kegs/devices", f"{base}/api/kegs/devices/")
+
+                async with aiohttp.ClientSession() as http:
+                    for url in urls:
+                        try:
+                            async with http.get(url) as resp:
+                                if resp.status != 200:
+                                    _ = await resp.text()
+                                    continue
+                                data = await resp.json()
+                                if isinstance(data, list):
+                                    # normalize to strings
+                                    ids = [str(x) for x in data]
+                                    state["devices"] = ids
+                                    # notify select platform to refresh options
+                                    hass.bus.async_fire(DEVICES_UPDATE_EVENT, {"ids": ids})
+                                    return ids
+                        except Exception as e:
+                            _LOGGER.debug("%s: REST devices GET failed %s (%s)", DOMAIN, url, e)
+                return state.setdefault("devices", [])
+            except Exception as e:
+                _LOGGER.error("%s: fetch_devices error: %s", DOMAIN, e)
+                return state.setdefault("devices", [])
+        async def refresh_devices(call: ServiceCall):
+            ids = await fetch_devices()
+            pn_create(hass, f"Found {len(ids)} device(s).", title="Beer Keg Devices")
+
+        hass.services.async_register(DOMAIN, "refresh_devices", refresh_devices)
+        async def _start_after_started(event=None):
+            await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+            try:
+                # initial devices + kegs
+                await fetch_devices()
+                initial = await fetch_kegs()
+                for raw in initial:
+                    norm = _normalize_keg_dict(raw)
+                    await _publish_keg(norm)
+                _LOGGER.info("%s: Initial REST refresh found %d kegs", DOMAIN, len(initial))
+            except Exception as e:
+                _LOGGER.warning("%s: Initial REST refresh failed: %s", DOMAIN, e)
+
+            hass.async_create_task(connect_websocket())
+            async_track_time_interval(hass, rest_poll, timedelta(seconds=REST_POLL_SECONDS))
+            async_track_time_interval(hass, watchdog, timedelta(seconds=10))
+            async_track_time_interval(hass, lambda now: hass.async_create_task(fetch_devices()),
+                                      timedelta(seconds=DEVICES_REFRESH_SEC))
+            _LOGGER.info("%s: started background tasks", DOMAIN)
 
         # ---------- Publisher
         async def _publish_keg(norm: dict):
@@ -388,6 +447,50 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except Exception as e:
         _LOGGER.exception("%s: setup_entry crashed: %s", DOMAIN, e)
         return False
+
+        # Helper to build REST base from ws_url
+        def _rest_base_from_ws(ws: str) -> str:
+            u = urlparse(ws)
+            scheme = "http" if u.scheme == "ws" else "https" if u.scheme == "wss" else "http"
+            return urlunparse((scheme, u.netloc, "", "", "", ""))
+
+        # --- Service: calibrate_keg (POST /api/kegs/calibrate)
+        async def calibrate_keg(call: ServiceCall):
+            rest_base = _rest_base_from_ws(state["ws_url"])
+            url = f"{rest_base}/api/kegs/calibrate"
+            payload = {
+                "id": call.data.get("id"),
+                "name": call.data.get("name"),
+                "full_weight": float(call.data.get("full_weight")),
+                "weight_calibrate": float(call.data.get("weight_calibrate")),
+                "temperature_calibrate": float(call.data.get("temperature_calibrate")),
+            }
+            try:
+                async with aiohttp.ClientSession() as http:
+                    async with http.post(url, json=payload) as resp:
+                        if resp.status != 200:
+                            body = await resp.text()
+                            raise RuntimeError(f"HTTP {resp.status}: {body[:200]}")
+                pn_create(hass, "Calibration saved.", title="Beer Keg")
+                # Pull fresh values
+                await refresh_kegs(ServiceCall(DOMAIN, "refresh_kegs", {}))
+            except Exception as e:
+                _LOGGER.error("%s: calibrate_keg failed: %s", DOMAIN, e)
+                pn_create(hass, f"Calibration failed: {e}", title="Beer Keg")
+
+        hass.services.async_register(DOMAIN, "calibrate_keg", calibrate_keg)
+
+        # --- Service: set_display_units (store prefs in memory; UI uses them)
+        async def set_display_units(call: ServiceCall):
+            weight_unit = call.data.get("weight_unit", "kg")
+            temp_unit = call.data.get("temp_unit", "°C")
+            state["display_units"] = {"weight": weight_unit, "temp": temp_unit}
+            # re-fire events so template/conditional cards respond immediately
+            for keg_id in list(state.get("data", {}).keys()):
+                hass.bus.async_fire(f"{DOMAIN}_update", {"keg_id": keg_id})
+            pn_create(hass, f"Display units set to {weight_unit}, {temp_unit}", title="Beer Keg")
+
+        hass.services.async_register(DOMAIN, "set_display_units", set_display_units)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
