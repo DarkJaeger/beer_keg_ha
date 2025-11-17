@@ -34,7 +34,7 @@ Live keg weight, temperature, fill %, pours, and history — with WebSocket + RE
 
 &nbsp; - Per-keg full weights JSON: `{ "keg\_id": 19.0 }`
 
-
+\.Restart Home Assistant
 
 \## Entities
 

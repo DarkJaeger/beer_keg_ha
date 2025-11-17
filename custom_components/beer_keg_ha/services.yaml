@@ -1,55 +1,72 @@
 export_history:
-  name: Export history
-  description: Export pour history to /config/www/beer_keg_history.json
+  name: Export History
+  description: Write pour history to /config/www/beer_keg_history.json (served at /local/beer_keg_history.json)
+
 refresh_kegs:
-  name: Refresh kegs
-  description: Fetch /api/kegs and merge into Home Assistant
+  name: Refresh Kegs (REST)
+  description: Pull the latest keg data from the REST API and update sensors
+
+republish_all:
+  name: Republish All
+  description: Re-fire update events for all known kegs (useful to refresh dashboards)
+
+refresh_devices:
+  name: Refresh Device List
+  description: Query /api/kegs/devices to update the device selector (select.beer_keg_devices)
+
 calibrate_keg:
   name: Calibrate Keg
-  description: Send calibration to keg server (/api/kegs/calibrate)
+  description: Send calibration payload to /api/kegs/calibrate
   fields:
     id:
+      name: Keg ID
+      description: Target keg id (e.g., from select.beer_keg_devices)
       required: true
+      example: "00000000000000000000000000000001"
       selector:
         text:
     name:
+      name: Name
       required: true
       selector:
         text:
     full_weight:
+      name: Full weight (kg)
       required: true
       selector:
         number:
           min: 0
           step: 0.01
     weight_calibrate:
+      name: Weight calibrate (kg)
       required: true
       selector:
         number:
           min: -10
+          max: 10
           step: 0.01
     temperature_calibrate:
+      name: Temperature calibrate (°C)
       required: true
       selector:
         number:
           min: -10
+          max: 10
           step: 0.1
 
 set_display_units:
   name: Set Display Units
-  description: Set dashboard display preferences for weight/temperature
+  description: Update dashboard display units for weight and temperature
   fields:
     weight_unit:
+      name: Weight unit
       required: true
       selector:
         select:
-          options:
-            - kg
-            - lb
+          options: [kg, lb]
     temp_unit:
+      name: Temperature unit
       required: true
       selector:
         select:
-          options:
-            - °C
-            - °F
+          options: ["°C", "°F"]
