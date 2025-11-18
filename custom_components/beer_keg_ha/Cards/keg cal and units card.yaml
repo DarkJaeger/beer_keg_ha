@@ -1,0 +1,51 @@
+type: vertical-stack
+cards:
+  - type: markdown
+    content: |
+      ## 🍺 Keg Calibration & Units
+      Select a keg, edit values, and save.
+  - type: entities
+    entities:
+      - entity: select.keg_device
+        name: Keg ID
+      - entity: input_text.beer_keg_name
+        name: Keg Name
+      - entity: input_number.keg_cfg_full_weight_kg
+        name: Full weight (kg)
+      - entity: input_number.keg_cfg_weight_cal
+        name: Weight calibrate
+      - entity: input_number.keg_cfg_temp_cal_c
+        name: Temp calibrate (°C)
+      - type: divider
+      - entity: select.keg_weight_unit
+        name: Display weight unit
+      - entity: select.keg_temperature_unit
+        name: Display temperature unit
+  - type: horizontal-stack
+    cards:
+      - show_name: true
+        show_icon: true
+        type: button
+        name: Save calibration
+        icon: mdi:content-save
+        tap_action:
+          action: call-service
+          service: beer_keg_ha.calibrate_keg
+          data:
+            id: "{{ states('input_text.keg_cfg_id') }}"
+            name: "{{ states('input_text.keg_cfg_name') }}"
+            full_weight: "{{ states('input_number.keg_cfg_full_weight_kg') | float(0) }}"
+            weight_calibrate: "{{ states('input_number.keg_cfg_weight_cal') | float(0) }}"
+            temperature_calibrate: "{{ states('input_number.keg_cfg_temp_cal_c') | float(0) }}"
+      - type: button
+        name: Apply units
+        icon: mdi:tune-vertical
+        tap_action:
+          action: call-service
+          service: beer_keg_ha.set_display_units
+      - type: button
+        name: Refresh
+        icon: mdi:refresh
+        tap_action:
+          action: call-service
+          service: beer_keg_ha.refresh_kegs

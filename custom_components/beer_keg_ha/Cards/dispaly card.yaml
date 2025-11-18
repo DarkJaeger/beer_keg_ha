@@ -1,0 +1,39 @@
+type: vertical-stack
+cards:
+  - type: entities
+    title: 🍺 Tap 1 Status
+    entities:
+      - entity: sensor.keg_d00dcafe5ded57971fce7ec1b3ff4253_weight_display
+        name: Current Weight
+        icon: mdi:scale
+      - entity: sensor.keg_d00dcafe5ded57971fce7ec1b3ff4253_fill_level
+        name: Fill Level
+        icon: mdi:beer
+      - entity: sensor.keg_d00dcafe5ded57971fce7ec1b3ff4253_temperature_display
+        name: Temperature
+        icon: mdi:thermometer
+      - entity: sensor.keg_d00dcafe5ded57971fce7ec1b3ff4253_last_pour
+        name: Last Pour
+        icon: mdi:cup
+      - entity: sensor.keg_d00dcafe5ded57971fce7ec1b3ff4253_daily_consumption
+        name: Daily Consumption
+        icon: mdi:calendar-today
+      - entity: sensor.keg_d00dcafe5ded57971fce7ec1b3ff4253_name
+        name: TAP1
+  - type: gauge
+    entity: sensor.keg_d00dcafe5ded57971fce7ec1b3ff4253_fill_level
+    name: Tap1 Fill %
+    min: 0
+    max: 100
+    severity:
+      green: 50
+      yellow: 25
+      red: 10
+  - type: history-graph
+    title: Tap1 – Last 24h
+    hours_to_show: 24
+    entities:
+      - entity: sensor.keg_d00dcafe5ded57971fce7ec1b3ff4253_weight
+        name: Weight
+      - entity: sensor.keg_d00dcafe5ded57971fce7ec1b3ff4253_daily_consumption
+        name: Daily Consumption

@@ -1,0 +1,41 @@
+type: custom:button-card
+entity: sensor.keg_d00dcafe5ded57971fce7ec1b3ff4253_fill_level
+show_icon: false
+show_name: false
+show_state: false
+styles:
+  card:
+    - width: 180px
+    - height: 380px
+    - padding: 0
+    - border-radius: 16px
+    - background: "#1c1c1c"
+    - box-shadow: 0 6px 18px rgba(0,0,0,0.35)
+  custom_fields:
+    keg:
+      - position: absolute
+      - inset: 0
+      - display: flex
+      - align-items: center
+      - justify-content: center
+custom_fields:
+  keg: >-
+    [[[ const pct = entity && entity.state ? Math.max(0, Math.min(100,
+    parseFloat(entity.state))) : 0; const IX=44,IY=56,IW=112,IH=388; const
+    h=Math.round((pct/100)*IH); const y=IY+IH-h; const
+    color=pct>50?"#00c66a":(pct>20?"#ffcc00":"#ff4545"); return `<svg viewBox="0
+    0 200 500" width="160" height="400"
+    xmlns="http://www.w3.org/2000/svg"><defs><clipPath id="k"><rect x="${IX}"
+    y="${IY}" width="${IW}" height="${IH}" rx="12"
+    ry="12"/></clipPath><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop
+    offset="0%" stop-color="${color}" stop-opacity="0.95"/><stop offset="100%"
+    stop-color="#3b2f1f" stop-opacity="0.85"/></linearGradient></defs><rect
+    x="40" y="20" width="120" height="460" rx="20" ry="20" fill="none"
+    stroke="#b3b3b3" stroke-width="8"/><rect x="35" y="20" width="130"
+    height="32" rx="16" ry="16" fill="none" stroke="#b3b3b3"
+    stroke-width="6"/><rect x="35" y="448" width="130" height="32" rx="16"
+    ry="16" fill="none" stroke="#b3b3b3" stroke-width="6"/><rect x="${IX}"
+    y="${y}" width="${IW}" height="${h}" clip-path="url(#k)"
+    fill="url(#g)"/><text x="100" y="260" text-anchor="middle" fill="#ffffff"
+    font-size="28"
+    font-weight="700">${isFinite(pct)?Math.round(pct):"—"}%</text></svg>`; ]]]
