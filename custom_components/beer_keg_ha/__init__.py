@@ -599,80 +599,65 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.services.async_register(DOMAIN, "calibrate_keg", calibrate_keg)
 
         async def set_display_units(call: ServiceCall) -> None:
-            """
-            Service to change weight/temperature/volume display units and persist them.
+           """
+           Service to change weight / temperature / pour units.
+           Pour units can be 'oz' or 'ml'.
+           """
 
-            Priority:
-            1) weight_unit / temp_unit / volume_unit from service data (if provided)
-            2) Current state of our helper entities (select/input_select)
-            3) Existing stored prefs (state["display_units"])
-            """
+           # 1) From service call
+           weight_unit = call.data.get("weight_unit")
+           temp_unit = call.data.get("temp_unit")
+           pour_unit = call.data.get("pour_unit")
 
-            # 1) From service call data
-            weight_unit = call.data.get("weight_unit")
-            temp_unit = call.data.get("temp_unit")
-            volume_unit = call.data.get("volume_unit")
+           # 2) Fallback: read from helper entities
+           # Weight
+           if weight_unit not in ("kg", "lb", None):
+               weight_unit = None
+           if weight_unit is None:
+               for ent_id in WEIGHT_UNIT_ENTITIES:
+                   ent = hass.states.get(ent_id)
+                   if ent and ent.state in ("kg", "lb"):
+                       weight_unit = ent.state
+                       break
 
-            # 2) If missing, read from helper entities in order
-            if weight_unit is None:
-                for ent_id in WEIGHT_UNIT_ENTITIES:
-                    ent = hass.states.get(ent_id)
-                    if ent and ent.state in ("kg", "lb"):
-                        weight_unit = ent.state
-                        break
+           # Temperature
+           if temp_unit not in ("°C", "°F", None):
+               temp_unit = None
+           if temp_unit is None:
+               for ent_id in TEMP_UNIT_ENTITIES:
+                   ent = hass.states.get(ent_id)
+                   if ent and ent.state in ("°C", "°F"):
+                       temp_unit = ent.state
+                       break
 
-            if temp_unit is None:
-                for ent_id in TEMP_UNIT_ENTITIES:
-                    ent = hass.states.get(ent_id)
-                    if ent and ent.state in ("°C", "°F"):
-                        temp_unit = ent.state
-                        break
+           # Pour units (NEW)
+           if pour_unit not in ("oz", "ml", None):
+               pour_unit = None
+           if pour_unit is None:
+               pour_unit = state["display_units"].get("pour", "oz")
 
-            if volume_unit is None:
-                for ent_id in VOLUME_UNIT_ENTITIES:
-                    ent = hass.states.get(ent_id)
-                    if ent and ent.state in ("oz", "ml"):
-                        volume_unit = ent.state
-                        break
+           # 3) Apply defaults
+           if weight_unit is None:
+               weight_unit = state["display_units"].get("weight", "kg")
+           if temp_unit is None:
+               temp_unit = state["display_units"].get("temp", "°C")
+           if pour_unit is None:
+               pour_unit = "oz"
 
-            # 3) Fallback to existing prefs
-            if weight_unit not in ("kg", "lb"):
-                weight_unit = state["display_units"].get("weight", "kg")
-            if temp_unit not in ("°C", "°F"):
-                temp_unit = state["display_units"].get("temp", "°C")
-            if volume_unit not in ("oz", "ml"):
-                volume_unit = state["display_units"].get("volume", "oz")
-
-            # Save in memory
-            state["display_units"] = {
+           # Save
+           state["display_units"] = {
                 "weight": weight_unit,
                 "temp": temp_unit,
-                "volume": volume_unit,
-            }
+                "pour": pour_unit,
+    }
 
-            # Persist to prefs so settings survive reboot
-            await state["prefs_store"].async_save({"display_units": state["display_units"]})
+    # Persist so it survives reboot
+    await state["prefs_store"].async_save({"display_units": state["display_units"]})
 
-            # Fire updates to refresh sensors
-            for keg_id in list(state.get("data", {}).keys()):
-                hass.bus.async_fire(f"{DOMAIN}_update", {"keg_id": keg_id})
+    # Notify UI
+    for keg_id in list(state.get("data", {}).keys()):
+        hass.bus.async_fire_
 
-            pn_create(
-                hass,
-                f"Display units set to weight={weight_unit}, temp={temp_unit}, volume={volume_unit}",
-                title="Beer Keg",
-            )
-
-
-            # Fire updates so sensors recalc value + unit
-            for keg_id in list(state.get("data", {}).keys()):
-                hass.bus.async_fire(f"{DOMAIN}_update", {"keg_id": keg_id})
-
-            pn_create(
-                hass,
-                f"Display units set to {weight_unit}, {temp_unit}",
-                title="Beer Keg",
-            )
 
 
         hass.services.async_register(DOMAIN, "set_display_units", set_display_units)
