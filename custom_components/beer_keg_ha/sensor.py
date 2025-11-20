@@ -92,6 +92,22 @@ SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
         "device_class": None,
         "state_class": None,
     },
+        "last_pour": {
+        "unit": "oz",
+        "name": "Last Pour",
+        "key": "last_pour",
+        "icon": "mdi:cup-water",
+        "device_class": None,
+        "state_class": "measurement",
+    },
+        "last_pour_ml": {
+        "unit": "ml",
+        "name": "Last Pour (ml)",
+        "key": "last_pour_ml",
+        "icon": "mdi:cup-water",
+        "device_class": None,
+        "state_class": "measurement",
+    },
 
     # ---- NEW: DISPLAY SENSORS (FOLLOW display_units) ----
     # These are what you’ll point your Lovelace cards at.
@@ -193,44 +209,80 @@ class KegSensor(SensorEntity):
         du = self._state_ref.get("display_units") or {}
         weight_u = du.get("weight", "kg")
         temp_u = du.get("temp", "°C")
+        volume_u = du.get("volume", "oz")
 
         if weight_u not in ("kg", "lb"):
             weight_u = "kg"
         if temp_u not in ("°C", "°F"):
             temp_u = "°C"
+        if volume_u not in ("oz", "ml"):
+            volume_u = "oz"
 
-        return {"weight": weight_u, "temp": temp_u}
+        return {"weight": weight_u, "temp": temp_u, "volume": volume_u}
+
 
     # ---- core value ----
 
     @property
+        @property
     def native_value(self) -> Any:
-        """Return value, converted for display_* sensors according to Beer Keg display units."""
+        """Return value, converted according to Beer Keg display units."""
         data: Dict[str, Dict[str, Any]] = self._state_ref.get("data", {})
         raw = data.get(self.keg_id, {}).get(self._meta["key"])
 
         if raw is None:
             return None
 
-        # ---- BASE SENSORS: keep raw units (kg / °C / etc.) ----
+        units = self._get_display_units()
 
+        # ---- weight & full_weight (stored as kg) ----
         if self.sensor_type in ("weight", "full_weight"):
-            # raw kg, no conversion
             try:
-                val = float(raw)
+                raw_kg = float(raw)
             except (TypeError, ValueError):
                 return None
-            self._attr_native_unit_of_measurement = "kg"
-            return round(val, 2)
 
+            if units["weight"] == "lb":
+                # convert kg -> lb
+                self._attr_native_unit_of_measurement = "lb"
+                return round(raw_kg * 2.20462, 2)
+            else:
+                # stay in kg
+                self._attr_native_unit_of_measurement = "kg"
+                return round(raw_kg, 2)
+
+        # ---- temperature (stored as °C) ----
         if self.sensor_type == "temperature":
-            # raw °C, no conversion
             try:
-                val = float(raw)
+                raw_c = float(raw)
             except (TypeError, ValueError):
                 return None
-            self._attr_native_unit_of_measurement = "°C"
-            return round(val, 1)
+
+            if units["temp"] == "°F":
+                self._attr_native_unit_of_measurement = "°F"
+                return round((raw_c * 9.0 / 5.0) + 32.0, 1)
+            else:
+                self._attr_native_unit_of_measurement = "°C"
+                return round(raw_c, 1)
+
+        # ---- volume (stored as oz) ----
+        if self.sensor_type in ("last_pour", "daily_consumed"):
+            try:
+                raw_oz = float(raw)
+            except (TypeError, ValueError):
+                return None
+
+            if units["volume"] == "ml":
+                # 1 US fl oz = 29.5735 ml
+                self._attr_native_unit_of_measurement = "ml"
+                return int(round(raw_oz * 29.5735))
+            else:
+                self._attr_native_unit_of_measurement = "oz"
+                return round(raw_oz, 1)
+
+        # ---- everything else: no conversion ----
+        self._attr_native_unit_of_measurement = self._meta.get("unit")
+        return raw
 
         # ---- DISPLAY SENSORS: follow display_units ----
 

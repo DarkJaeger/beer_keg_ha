@@ -40,7 +40,10 @@ TEMP_UNIT_ENTITIES = [
     "select.keg_temp_unit",
     "input_select.keg_temp_unit",
 ]
-
+VOLUME_UNIT_ENTITIES = [
+    "select.keg_volume_unit",
+    "input_select.keg_volume_unit",
+]
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -171,6 +174,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "display_units": {   # default; may be overridden by prefs below
                 "weight": "kg",
                 "temp": "°C",
+                "volume": "oz",   # NEW: base volume unit
             },
             "history_store": history_store,
             "prefs_store": prefs_store,
@@ -196,6 +200,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     state["display_units"]["weight"] = w
                 if t in ("°C", "°F"):
                     state["display_units"]["temp"] = t
+                if v in ("oz", "ml"):
+                    state["display_units"]["volume"] = v    
 
         # ---------- REST helpers
 
@@ -286,27 +292,37 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             prev_weight = info["last_weight"]
             info["last_weight"] = weight
 
-            # Pour detection (kg -> store oz)
+            # Pour detection (kg -> store oz + ml)
             if prev_weight - weight > state["pour_threshold"]:
-                delta_kg = round(prev_weight - weight, 2)
-                delta_oz = round(delta_kg * KG_TO_OZ, 1)
-                info["last_pour"] = delta_oz
-                info["last_pour_time"] = datetime.now(timezone.utc)
-                info["daily_consumed"] += delta_oz
+            delta_kg = round(prev_weight - weight, 2)
+            delta_oz = round(delta_kg * KG_TO_OZ, 1)
 
-                state["history"].append(
-                    {
-                        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z"),
-                        "keg": keg_id,
-                        "pour_oz": delta_oz,
-                        "weight_before_kg": round(prev_weight, 2),
-                        "weight_after_kg": round(weight, 2),
-                        "temperature_c": temp,
-                    }
-                )
-                if len(state["history"]) > MAX_LOG_ENTRIES:
-                    state["history"].pop(0)
-                await state["history_store"].async_save(state["history"][-MAX_LOG_ENTRIES:])
+            # Convert oz -> ml (1 fl oz = 29.5735 ml)
+            delta_ml = int(round(delta_oz * 29.5735))
+
+            # Existing oz behaviour
+            info["last_pour"] = delta_oz
+            info["last_pour_time"] = datetime.now(timezone.utc)
+            info["daily_consumed"] += delta_oz
+
+            # NEW: parallel ml value
+            info["last_pour_ml"] = delta_ml
+
+            state["history"].append(
+                {
+                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z"),
+                    "keg": keg_id,
+                    "pour_oz": delta_oz,
+                    "pour_ml": delta_ml,  # optional extra field in history
+                    "weight_before_kg": round(prev_weight, 2),
+                    "weight_after_kg": round(weight, 2),
+                    "temperature_c": temp,
+                }
+            )
+            if len(state["history"]) > MAX_LOG_ENTRIES:
+                state["history"].pop(0)
+            await state["history_store"].async_save(state["history"][-MAX_LOG_ENTRIES:])
+
 
             # Fill %
             fw = (
@@ -334,6 +350,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "temperature_calibrate": norm.get("temperature_calibrate"),
                 "daily_consumed": round(info["daily_consumed"], 1),
                 "last_pour": round(info["last_pour"], 1),
+                "fill_percent": round(fill_pct, 1),
+                # NEW: last pour in ml (may be None before first pour)
+                "last_pour_ml": info.get("last_pour_ml"),
                 "fill_percent": round(fill_pct, 1),
             }
             state[LAST_UPDATE_KEY] = datetime.now(timezone.utc)
@@ -536,24 +555,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         async def set_display_units(call: ServiceCall) -> None:
             """
-            Service to change weight/temperature display units and persist them.
+            Service to change weight/temperature/volume display units and persist them.
 
             Priority:
-            1) weight_unit / temp_unit from service data (if provided and valid)
-            2) Current state of our unit helper entities (select/input_select)
+            1) weight_unit / temp_unit / volume_unit from service data (if provided)
+            2) Current state of our helper entities (select/input_select)
             3) Existing stored prefs (state["display_units"])
             """
 
-            # 1) From service call data (may be literal Jinja from Lovelace)
+            # 1) From service call data
             weight_unit = call.data.get("weight_unit")
             temp_unit = call.data.get("temp_unit")
-
-            # If they look like templates from Lovelace (e.g. "{{ states('...') }}"),
-            # treat them as not provided so we fall back to helpers.
-            if isinstance(weight_unit, str) and "{{" in weight_unit:
-                weight_unit = None
-            if isinstance(temp_unit, str) and "{{" in temp_unit:
-                temp_unit = None
+            volume_unit = call.data.get("volume_unit")
 
             # 2) If missing, read from helper entities in order
             if weight_unit is None:
@@ -570,19 +583,41 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         temp_unit = ent.state
                         break
 
-            # 3) Fallback to existing prefs if still invalid
+            if volume_unit is None:
+                for ent_id in VOLUME_UNIT_ENTITIES:
+                    ent = hass.states.get(ent_id)
+                    if ent and ent.state in ("oz", "ml"):
+                        volume_unit = ent.state
+                        break
+
+            # 3) Fallback to existing prefs
             if weight_unit not in ("kg", "lb"):
                 weight_unit = state["display_units"].get("weight", "kg")
             if temp_unit not in ("°C", "°F"):
                 temp_unit = state["display_units"].get("temp", "°C")
+            if volume_unit not in ("oz", "ml"):
+                volume_unit = state["display_units"].get("volume", "oz")
 
             # Save in memory
-            state["display_units"] = {"weight": weight_unit, "temp": temp_unit}
+            state["display_units"] = {
+                "weight": weight_unit,
+                "temp": temp_unit,
+                "volume": volume_unit,
+            }
 
-            # Persist so it survives reboot
-            await state["prefs_store"].async_save(
-                {"display_units": state["display_units"]}
+            # Persist to prefs so settings survive reboot
+            await state["prefs_store"].async_save({"display_units": state["display_units"]})
+
+            # Fire updates to refresh sensors
+            for keg_id in list(state.get("data", {}).keys()):
+                hass.bus.async_fire(f"{DOMAIN}_update", {"keg_id": keg_id})
+
+            pn_create(
+                hass,
+                f"Display units set to weight={weight_unit}, temp={temp_unit}, volume={volume_unit}",
+                title="Beer Keg",
             )
+
 
             # Fire updates so sensors recalc value + unit
             for keg_id in list(state.get("data", {}).keys()):
