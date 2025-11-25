@@ -82,7 +82,7 @@ GLOBAL_NUMBER_TYPES: Dict[str, Dict[str, Any]] = {
         "max": 0.5,
         "step": 0.01,
         "mode": NumberMode.SLIDER,
-        "default": 0.05,
+        "default": 0.00,
     },
     "smoothing_alpha": {
         "name": "Beer Keg Smoothing Alpha",
@@ -91,7 +91,7 @@ GLOBAL_NUMBER_TYPES: Dict[str, Dict[str, Any]] = {
         "max": 1.0,
         "step": 0.05,
         "mode": NumberMode.SLIDER,
-        "default": 0.3,
+        "default": 0.1,
     },
 }
 
