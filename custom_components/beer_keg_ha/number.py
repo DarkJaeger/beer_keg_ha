@@ -8,7 +8,6 @@ from homeassistant.components.number import (
     NumberMode,
 )
 from homeassistant.config_entries import ConfigEntry
-    #  - full_weight / weight_calibrate: kg
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -83,8 +82,7 @@ GLOBAL_NUMBER_TYPES: Dict[str, Dict[str, Any]] = {
         "max": 0.5,
         "step": 0.01,
         "mode": NumberMode.SLIDER,
-        # 👉 Match __init__.py default
-        "default": 0.0,
+        "default": 0.0,   # match __init__.py default
     },
     "smoothing_alpha": {
         "name": "Beer Keg Smoothing Alpha",
@@ -93,9 +91,35 @@ GLOBAL_NUMBER_TYPES: Dict[str, Dict[str, Any]] = {
         "max": 1.0,
         "step": 0.05,
         "mode": NumberMode.SLIDER,
-        # 👉 Match __init__.py default (no extra smoothing)
-        "default": 1.0,
+        "default": 1.0,   # match __init__.py default (no smoothing)
     },
+}
+
+#
+# Tap-level numbers (ABV, IBU, etc.) backed by state["tap_numbers"]
+#
+# These become entities like:
+#   number.tap_1_abv
+#   number.tap_1_ibu
+#
+TAP_NUMBER_TYPES: Dict[str, Dict[str, Any]] = {
+    "abv": {
+        "name": "ABV (%)",
+        "min": 0.0,
+        "max": 20.0,
+        "step": 0.1,
+        "mode": NumberMode.BOX,
+        "unit": "%",
+    },
+    "ibu": {
+        "name": "IBU",
+        "min": 0.0,
+        "max": 200.0,
+        "step": 1.0,
+        "mode": NumberMode.BOX,
+        "unit": None,
+    },
+    # You can add more here later, e.g. "og", "fg", etc.
 }
 
 
@@ -104,7 +128,7 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up keg calibration + smoothing numbers from a config entry."""
+    """Set up keg calibration + smoothing numbers + tap numbers from a config entry."""
     state = hass.data[DOMAIN][entry.entry_id]
 
     entities: List[NumberEntity] = []
@@ -112,7 +136,6 @@ async def async_setup_entry(
     #
     # 1) Global smoothing sliders (once per integration entry)
     #
-    # If __init__ already set these (from options/prefs), setdefault will NOT overwrite.
     state.setdefault(
         "noise_deadband_kg",
         GLOBAL_NUMBER_TYPES["noise_deadband_kg"]["default"],
@@ -128,36 +151,65 @@ async def async_setup_entry(
     #
     # 2) Per-keg calibration numbers
     #
-    created: Set[str] = state.setdefault("created_number_kegs", set())
+    created_kegs: Set[str] = state.setdefault("created_number_kegs", set())
 
-    def create_for(keg_id: str) -> None:
+    def create_for_keg(keg_id: str) -> None:
         """Create all number entities for one keg_id (once)."""
-        if keg_id in created:
+        if keg_id in created_kegs:
             return
 
         for num_type in NUMBER_TYPES.keys():
             entities.append(BeerKegNumberEntity(hass, entry, keg_id, num_type))
 
-        created.add(keg_id)
+        created_kegs.add(keg_id)
 
     # Create numbers for any kegs we already know about
     for keg_id in list(state.get("data", {}).keys()):
-        create_for(keg_id)
+        create_for_keg(keg_id)
 
-    # Add initial batch (global + existing kegs)
+    #
+    # 3) Tap-level numbers (ABV/IBU etc.)
+    #
+    tap_entities: List[NumberEntity] = []
+
+    tap_keys: Set[str] = set()
+    tap_text = state.get("tap_text") or {}
+    tap_numbers_state = state.get("tap_numbers") or {}
+
+    # Discover tap IDs from existing tap_text / tap_numbers, e.g. "tap_1", "tap_2"
+    for key in tap_text.keys():
+        if isinstance(key, str) and key.startswith("tap_"):
+            tap_keys.add(key)
+    for key in tap_numbers_state.keys():
+        if isinstance(key, str) and key.startswith("tap_"):
+            tap_keys.add(key)
+
+    # If nothing yet, assume tap_1..tap_4 as a friendly default
+    if not tap_keys:
+        tap_keys = {f"tap_{i}" for i in range(1, 5)}
+
+    for tap_key in sorted(tap_keys):
+        for field_key, meta in TAP_NUMBER_TYPES.items():
+            tap_entities.append(
+                BeerKegTapNumberEntity(hass, entry, tap_key, field_key, meta)
+            )
+
+    entities.extend(tap_entities)
+
+    # Add initial batch (global + existing kegs + taps)
     async_add_entities(entities, True)
 
     @callback
     def _on_update(event) -> None:
         """Create entities for new kegs when they appear."""
         keg_id = (event.data or {}).get("keg_id")
-        if not keg_id or keg_id in created:
+        if not keg_id or keg_id in created_kegs:
             return
 
         new_entities: List[NumberEntity] = []
         for num_type in NUMBER_TYPES.keys():
             new_entities.append(BeerKegNumberEntity(hass, entry, keg_id, num_type))
-        created.add(keg_id)
+        created_kegs.add(keg_id)
         async_add_entities(new_entities, True)
 
     entry.async_on_unload(
@@ -189,12 +241,6 @@ class BeerKegGlobalNumberEntity(NumberEntity):
         self._attr_native_max_value = meta["max"]
         self._attr_native_step = meta["step"]
 
-        # cosmetic: only noise_deadband has a real unit
-        if self._state_key == "noise_deadband_kg":
-            self._attr_native_unit_of_measurement = "kg"
-        else:
-            self._attr_native_unit_of_measurement = None
-
     @property
     def device_info(self) -> DeviceInfo:
         """Group these under a 'Beer Keg Settings' device."""
@@ -218,10 +264,10 @@ class BeerKegGlobalNumberEntity(NumberEntity):
         domain_state = self.hass.data[DOMAIN][self.entry.entry_id]
         domain_state[self._state_key] = float(value)
 
-        # Persist along with other prefs (tap text, tap numbers, etc)
-        prefs = domain_state.get("prefs_store")
-        if prefs:
-            await prefs.async_save(
+        # Persist (along with all other prefs) so smoothing survives restart
+        prefs_store = domain_state.get("prefs_store")
+        if prefs_store is not None:
+            await prefs_store.async_save(
                 {
                     "display_units": domain_state.get("display_units", {}),
                     "keg_config": domain_state.get("keg_config", {}),
@@ -333,3 +379,88 @@ class BeerKegNumberEntity(NumberEntity):
             self.hass.bus.async_listen(PLATFORM_EVENT, _handle_update)
         )
 
+
+class BeerKegTapNumberEntity(NumberEntity):
+    """Tap-level number entity (ABV, IBU, etc.) stored in state['tap_numbers']."""
+
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        tap_key: str,       # e.g. "tap_1"
+        field_key: str,     # e.g. "abv", "ibu"
+        meta: Dict[str, Any],
+    ) -> None:
+        self.hass = hass
+        self.entry = entry
+        self.tap_key = tap_key
+        self.field_key = field_key
+        self._meta = meta
+
+        # Extract numeric part for display ("Tap 1 ABV (%)")
+        try:
+            tap_index = tap_key.split("_", 1)[1]
+        except Exception:
+            tap_index = tap_key
+
+        self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}_{tap_key}_{field_key}"
+        self._attr_name = f"Tap {tap_index} {meta['name']}"
+        self._attr_mode = meta["mode"]
+        self._attr_native_min_value = meta["min"]
+        self._attr_native_max_value = meta["max"]
+        self._attr_native_step = meta["step"]
+        self._attr_native_unit_of_measurement = meta.get("unit")
+
+        # Force specific entity_id so the Lovelace card can reference
+        # number.tap_1_abv, number.tap_1_ibu, etc.
+        self.entity_id = f"number.{tap_key}_{field_key}"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Group tap numbers under a 'Beer Keg Settings' device."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"{self.entry.entry_id}_settings")},
+            name="Beer Keg Settings",
+            manufacturer="Beer Keg",
+            model="WebSocket + REST",
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the current value from tap_numbers state."""
+        domain_state = self.hass.data[DOMAIN][self.entry.entry_id]
+        tap_numbers: Dict[str, Dict[str, Any]] = domain_state.get("tap_numbers", {})
+        per_tap = tap_numbers.get(self.tap_key, {})
+        val = per_tap.get(self.field_key)
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
+    async def async_set_native_value(self, value: float) -> None:
+        """Update tap_numbers and persist to prefs."""
+        domain_state = self.hass.data[DOMAIN][self.entry.entry_id]
+        tap_numbers: Dict[str, Dict[str, Any]] = domain_state.setdefault("tap_numbers", {})
+        per_tap = tap_numbers.setdefault(self.tap_key, {})
+        per_tap[self.field_key] = float(value)
+
+        # Persist along with other prefs (tap_text, smoothing, etc.)
+        prefs_store = domain_state.get("prefs_store")
+        if prefs_store is not None:
+            await prefs_store.async_save(
+                {
+                    "display_units": domain_state.get("display_units", {}),
+                    "keg_config": domain_state.get("keg_config", {}),
+                    "tap_text": domain_state.get("tap_text", {}),
+                    "tap_numbers": tap_numbers,
+                    "noise_deadband_kg": domain_state.get("noise_deadband_kg"),
+                    "smoothing_alpha": domain_state.get("smoothing_alpha"),
+                }
+            )
+
+        # No specific keg_id to nudge; UI (cards) read this entity directly
+        self.async_write_ha_state()

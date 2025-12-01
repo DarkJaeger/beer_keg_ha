@@ -19,22 +19,13 @@ from .const import (
     DEFAULT_BEER_SG,
 )
 
-
-def _validate_ws_url(value: str) -> str:
-    """Ensure the URL looks like a WebSocket URL."""
-    v = (value or "").strip()
-    if not (v.startswith("ws://") or v.startswith("wss://")):
-        raise vol.Invalid("WebSocket URL must start with ws:// or wss://")
-    return v
-
-
 # -------------------------------------------------------------------
 # INITIAL CONFIG FLOW (first-time setup)
 # -------------------------------------------------------------------
 
 STEP_USER_SCHEMA = vol.Schema(
     {
-        vol.Required(CONF_WS_URL): _validate_ws_url,
+        vol.Required(CONF_WS_URL): str,
     }
 )
 
@@ -62,7 +53,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_import(self, user_input=None) -> FlowResult:
-        """Handle import from YAML, if ever used."""
+        """Handle import from YAML if ever used."""
         return await self.async_step_user(user_input)
 
 
@@ -79,9 +70,7 @@ class BeerKegOptionsFlowHandler(config_entries.OptionsFlow):
     async def async_step_init(self, user_input: dict | None = None) -> FlowResult:
         """Main options step."""
         if user_input is not None:
-            #
-            # 1) Pull ws_url out of the submitted data and update the entry's data
-            #
+            # 1) Pull ws_url out of submitted data and update entry.data
             new_ws_url = user_input.pop(
                 CONF_WS_URL,
                 self.config_entry.data.get(CONF_WS_URL, ""),
@@ -90,13 +79,11 @@ class BeerKegOptionsFlowHandler(config_entries.OptionsFlow):
             new_data = dict(self.config_entry.data)
             new_data[CONF_WS_URL] = new_ws_url
 
-            #
             # 2) Merge remaining fields into options
-            #
             new_options = dict(self.config_entry.options)
             new_options.update(user_input)
 
-            # Update the config entry (data + options)
+            # Update config entry (data + options)
             self.hass.config_entries.async_update_entry(
                 self.config_entry,
                 data=new_data,
@@ -105,16 +92,13 @@ class BeerKegOptionsFlowHandler(config_entries.OptionsFlow):
 
             return self.async_create_entry(title="", data={})
 
-        #
         # Show current values as defaults
-        #
         current_ws = self.config_entry.data.get(CONF_WS_URL, "")
-
         opts = self.config_entry.options or {}
 
         schema = vol.Schema(
             {
-                vol.Required(CONF_WS_URL, default=current_ws): _validate_ws_url,
+                vol.Required(CONF_WS_URL, default=current_ws): str,
                 vol.Optional(
                     CONF_EMPTY_WEIGHT,
                     default=opts.get(CONF_EMPTY_WEIGHT, 0.0),
@@ -153,4 +137,3 @@ async def async_get_options_flow(
 ) -> BeerKegOptionsFlowHandler:
     """Return the options flow handler."""
     return BeerKegOptionsFlowHandler(config_entry)
-

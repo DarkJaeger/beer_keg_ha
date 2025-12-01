@@ -14,7 +14,10 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.event import async_track_time_interval, async_track_time_change
+from homeassistant.helpers.event import (
+    async_track_time_interval,
+    async_track_time_change,
+)
 from homeassistant.helpers.storage import Store
 
 from .const import (
@@ -111,6 +114,39 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.error("%s: Missing ws_url", DOMAIN)
             return False
 
+        # 🔧 Normalize the WS URL:
+        # - Add ws:// if scheme is missing
+        # - If no path is present, default to /ws
+        raw_ws = ws_url.strip()
+        from urllib.parse import urlparse, urlunparse
+
+        u = urlparse(raw_ws)
+
+        # If user entered just "10.10.12.23:8085" or similar
+        if not u.scheme and u.path and not u.netloc:
+            raw_ws = f"ws://{raw_ws}"
+            u = urlparse(raw_ws)
+
+        scheme = u.scheme or "ws"
+        netloc = u.netloc or u.path
+        path = u.path or ""
+
+        if not path or path == "/":
+            # Default to /ws when no explicit path is given
+            path = "/ws"
+
+        ws_url_normalized = urlunparse((scheme, netloc, path, "", "", ""))
+
+        if ws_url_normalized != ws_url:
+            _LOGGER.info(
+                "%s: Normalized WS URL from %s to %s",
+                DOMAIN,
+                ws_url,
+                ws_url_normalized,
+            )
+
+        ws_url = ws_url_normalized
+
         opts = entry.options or {}
         empty_weight = float(opts.get(CONF_EMPTY_WEIGHT, DEFAULT_EMPTY_WEIGHT))
         default_full = float(opts.get(CONF_DEFAULT_FULL_WEIGHT, DEFAULT_FULL_WEIGHT))
@@ -161,16 +197,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "temp": "°C",
                 "pour": "oz",    # last_pour / daily_consumption base unit
             },
+            "tap_text": {},      # tap config (if you use it)
+            "tap_numbers": {},
             # Global smoothing config (overridable via Number entities)
-            "tap_text": {},      # will be overridden by prefs if present
-            "tap_numbers": {},   # "
             "noise_deadband_kg": float(opts.get("noise_deadband_kg", 0.0)),
             "smoothing_alpha": float(opts.get("smoothing_alpha", 1.0)),
             # Optional per-keg config that should survive restart
-            # (e.g. name override, beer_sg, original_gravity, kegged_date, expiration_date)
             "keg_config": {},
             "history_store": history_store,
             "prefs_store": prefs_store,
+            "background_tasks": [],   # track long-running tasks (WS loop, pinger, etc.)
             LAST_UPDATE_KEY: None,
         }
 
@@ -182,7 +218,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             state["history"] = loaded_history
             _LOGGER.info("%s: Loaded %d pour records", DOMAIN, len(state["history"]))
 
-        # ---- load prefs (display_units + keg_config + tap_text + tap_numbers + smoothing) from storage
+        # ---- load prefs (display_units + keg_config + tap_text + tap_numbers + smoothing)
         loaded_prefs = await prefs_store.async_load()
         if isinstance(loaded_prefs, dict):
             du = loaded_prefs.get("display_units")
@@ -352,17 +388,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 info["last_pour_time"] = datetime.now(timezone.utc)
                 info["daily_consumed"] += delta_oz
 
-                state["history"].append({
-                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z"),
-                    "keg": keg_id,
-                    "pour_oz": delta_oz,
-                    "weight_before_kg": round(prev_weight_raw, 2),
-                    "weight_after_kg": round(weight_raw, 2),
-                    "temperature_c": temp,
-                })
+                state["history"].append(
+                    {
+                        "timestamp": datetime.now(timezone.utc).strftime(
+                            "%Y-%m-%d %H:%M:%S %Z"
+                        ),
+                        "keg": keg_id,
+                        "pour_oz": delta_oz,
+                        "weight_before_kg": round(prev_weight_raw, 2),
+                        "weight_after_kg": round(weight_raw, 2),
+                        "temperature_c": temp,
+                    }
+                )
                 if len(state["history"]) > MAX_LOG_ENTRIES:
                     state["history"].pop(0)
-                await state["history_store"].async_save(state["history"][-MAX_LOG_ENTRIES:])
+                await state["history_store"].async_save(
+                    state["history"][-MAX_LOG_ENTRIES:]
+                )
 
             # ---------- APPLY MANUAL OVERRIDES FROM NUMBER ENTITIES ----------
             existing = state["data"].get(keg_id, {})
@@ -417,7 +459,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             if keg_id not in state["devices"]:
                 state["devices"].append(keg_id)
-                hass.bus.async_fire(DEVICES_UPDATE_EVENT, {"ids": list(state["devices"])})
+                hass.bus.async_fire(
+                    DEVICES_UPDATE_EVENT, {"ids": list(state["devices"])}
+                )
 
             hass.bus.async_fire(f"{DOMAIN}_update", {"keg_id": keg_id})
 
@@ -432,34 +476,48 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                             _LOGGER.info("%s: Connected to WS", DOMAIN)
 
                             async def _pinger() -> None:
-                                while True:
-                                    try:
-                                        await ws.ping()
-                                    except Exception:
-                                        break
-                                    await asyncio.sleep(WS_PING_SEC)
-
-                            hass.async_create_task(_pinger())
-
-                            async for msg in ws:
-                                if msg.type != aiohttp.WSMsgType.TEXT:
-                                    continue
                                 try:
-                                    data = json.loads(msg.data)
-                                except json.JSONDecodeError:
-                                    continue
+                                    while True:
+                                        await ws.ping()
+                                        await asyncio.sleep(WS_PING_SEC)
+                                except asyncio.CancelledError:
+                                    _LOGGER.debug("%s: WS pinger cancelled", DOMAIN)
+                                    return
+                                except Exception:
+                                    return
 
-                                if isinstance(data, list):
-                                    source = data
-                                else:
-                                    kegs = data.get("kegs")
-                                    source = kegs if isinstance(kegs, list) else None
-                                if not source:
-                                    continue
+                            # Track the pinger task
+                            ping_task = hass.async_create_task(_pinger())
+                            state["background_tasks"].append(ping_task)
 
-                                for raw in source:
-                                    norm = _normalize_keg_dict(raw)
-                                    await _publish_keg(norm)
+                            try:
+                                async for msg in ws:
+                                    if msg.type != aiohttp.WSMsgType.TEXT:
+                                        continue
+                                    try:
+                                        data = json.loads(msg.data)
+                                    except json.JSONDecodeError:
+                                        continue
+
+                                    if isinstance(data, list):
+                                        source = data
+                                    else:
+                                        kegs = data.get("kegs")
+                                        source = kegs if isinstance(kegs, list) else None
+                                    if not source:
+                                        continue
+
+                                    for raw in source:
+                                        norm = _normalize_keg_dict(raw)
+                                        await _publish_keg(norm)
+                            except asyncio.CancelledError:
+                                _LOGGER.info("%s: connect_websocket cancelled", DOMAIN)
+                                if not ping_task.done():
+                                    ping_task.cancel()
+                                return
+                    except asyncio.CancelledError:
+                        _LOGGER.info("%s: WS loop task cancelled", DOMAIN)
+                        return
                     except Exception as e:
                         _LOGGER.error("%s: WS error: %s", DOMAIN, e)
                         await asyncio.sleep(10)
@@ -507,17 +565,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             """Reset daily_consumed for all kegs at local midnight."""
             try:
                 for keg_id, info in state.get("kegs", {}).items():
-                    # Reset runtime stats
                     info["daily_consumed"] = 0.0
-
-                    # Reset exposed data if present
                     if keg_id in state.get("data", {}):
                         state["data"][keg_id]["daily_consumed"] = 0.0
-
-                    # Nudge HA entities to update
                     hass.bus.async_fire(f"{DOMAIN}_update", {"keg_id": keg_id})
 
-                _LOGGER.info("%s: daily_consumed reset to 0 for %d kegs", DOMAIN, len(state.get("kegs", {})))
+                _LOGGER.info(
+                    "%s: daily_consumed reset to 0 for %d kegs",
+                    DOMAIN,
+                    len(state.get("kegs", {})),
+                )
             except Exception as e:
                 _LOGGER.error("%s: failed resetting daily_consumed: %s", DOMAIN, e)
 
@@ -545,7 +602,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             for raw in new_kegs:
                 norm = _normalize_keg_dict(raw)
                 await _publish_keg(norm)
-            pn_create(hass, f"Refreshed {len(new_kegs)} kegs", title="Beer Keg Refresh")
+            pn_create(
+                hass,
+                f"Refreshed {len(new_kegs)} kegs",
+                title="Beer Keg Refresh",
+            )
 
         hass.services.async_register(DOMAIN, "refresh_kegs", refresh_kegs)
 
@@ -553,13 +614,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             data = state.get("data", {})
             for keg_id in data.keys():
                 hass.bus.async_fire(f"{DOMAIN}_update", {"keg_id": keg_id})
-            pn_create(hass, f"Republished {len(data)} kegs", title="Beer Keg Republish")
+            pn_create(
+                hass,
+                f"Republished {len(data)} kegs",
+                title="Beer Keg Republish",
+            )
 
         hass.services.async_register(DOMAIN, "republish_all", republish_all)
 
         async def refresh_devices(call: ServiceCall) -> None:
             ids = await fetch_devices()
-            pn_create(hass, f"Found {len(ids)} device(s).", title="Beer Keg Devices")
+            pn_create(
+                hass,
+                f"Found {len(ids)} device(s).",
+                title="Beer Keg Devices",
+            )
 
         hass.services.async_register(DOMAIN, "refresh_devices", refresh_devices)
 
@@ -569,24 +638,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             Supports three ways of getting data:
 
-            1) Direct values in service call (Dev Tools / automations):
-
-               data:
-                 id: "d00dcafe5ded57971fce7ec1b3ff4253"
-                 name: "My Keg"
-                 full_weight: 19.0
-                 weight_calibrate: 0.15
-                 temperature_calibrate: 0.0
-
-            2) Entity IDs in service call (from Lovelace button):
-
-               data:
-                 id_entity: select.keg_device
-                 name_entity: text.keg_d00d_keg_name
-                 full_weight_entity: number.keg_d00d_full_weight_kg
-                 weight_calibrate_entity: number.keg_d00d_weight_calibrate
-                 temperature_calibrate_entity: number.keg_d00d_temp_calibrate_degc_2
-
+            1) Direct values in service call
+            2) Entity IDs in service call
             3) Nothing in data: fall back to select.keg_device + state["data"][keg_id].
             """
 
@@ -616,19 +669,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             # ---------- 1) Resolve keg_id ----------
             keg_id = call.data.get("id")
 
-            # If user passed an id_entity (e.g. select.keg_device), use its state
             if not keg_id:
                 id_entity = call.data.get("id_entity")
                 keg_id = _get_ent_state(id_entity)
 
-            # Last fallback: select.keg_device
             if not keg_id:
                 dev_state = hass.states.get("select.keg_device")
                 if not dev_state or dev_state.state in ("unknown", "unavailable", ""):
                     pn_create(hass, "No keg selected.", title="Beer Keg Calibration")
                     _LOGGER.error(
-                        "%s: calibrate_keg – no keg id (no 'id', no id_entity, no select.keg_device)",
-                        DOMAIN,
+                        "%s: calibrate_keg – no keg id", DOMAIN
                     )
                     return
                 keg_id = dev_state.state
@@ -638,12 +688,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             keg_data = data_state.get(keg_id, {})
 
             # ---------- 2) Resolve name ----------
-            # Priority:
-            #   call.data.name ->
-            #   name_entity ->
-            #   text.keg_<short>_keg_name ->
-            #   stored keg name ->
-            #   keg_id
             name_from_call = call.data.get("name")
             if name_from_call:
                 keg_name = str(name_from_call)
@@ -653,7 +697,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 if name_val:
                     keg_name = name_val
                 else:
-                    # legacy per-keg text entity
                     legacy_name_ent = f"text.keg_{short_id}_keg_name"
                     legacy_name_val = _get_ent_state(legacy_name_ent)
                     if legacy_name_val:
@@ -661,27 +704,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     else:
                         keg_name = keg_data.get("name") or keg_id
 
-            # ---------- 3) Resolve numeric fields (full_weight, weight_cal, temp_cal) ----------
+            # ---------- 3) Resolve numeric fields ----------
 
             def _resolve_float(
-                direct_key: str,           # e.g. "full_weight"
-                entity_key: str,           # e.g. "full_weight_entity"
-                data_key: str,             # e.g. "full_weight"
+                direct_key: str,
+                entity_key: str,
+                data_key: str,
                 default: float,
             ) -> float:
-                # 1) Direct numeric in service data
                 if direct_key in call.data:
                     try:
                         return float(call.data.get(direct_key))
                     except (TypeError, ValueError):
                         pass
 
-                # 2) Entity id in service data (e.g. number.keg_d00d_full_weight_kg)
                 ent_id = call.data.get(entity_key)
                 if ent_id:
                     return _get_ent_float(ent_id, default)
 
-                # 3) state["data"][keg_id][data_key]
                 val = keg_data.get(data_key)
                 try:
                     return float(val)
@@ -722,7 +762,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 payload,
             )
 
-            # ---------- 4) POST to Plaato/Open-Plaato server ----------
             try:
                 async with aiohttp.ClientSession() as http_sess:
                     async with http_sess.post(url, json=payload) as resp:
@@ -732,7 +771,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
                 pn_create(hass, "Calibration saved.", title="Beer Keg")
 
-                # Refresh from server so numbers/sensors match new calibration
                 await refresh_kegs(ServiceCall(DOMAIN, "refresh_kegs", {}))
 
             except Exception as e:
@@ -744,20 +782,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         async def set_display_units(call: ServiceCall) -> None:
             """
             Change weight / temperature / pour units and persist them.
-
-            Can be called with explicit units, e.g.:
-
-              service: beer_keg_ha.set_display_units
-              data:
-                weight_unit: "lb"
-                temp_unit: "°F"
-                pour_unit: "ml"
-
-            or without data, in which case we keep existing settings.
             """
-            weight_unit = call.data.get("weight_unit") or state["display_units"].get("weight", "kg")
-            temp_unit = call.data.get("temp_unit") or state["display_units"].get("temp", "°C")
-            pour_unit = call.data.get("pour_unit") or state["display_units"].get("pour", "oz")
+            weight_unit = call.data.get("weight_unit") or state["display_units"].get(
+                "weight", "kg"
+            )
+            temp_unit = call.data.get("temp_unit") or state["display_units"].get(
+                "temp", "°C"
+            )
+            pour_unit = call.data.get("pour_unit") or state["display_units"].get(
+                "pour", "oz"
+            )
 
             if weight_unit not in ("kg", "lb"):
                 weight_unit = "kg"
@@ -784,7 +818,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 }
             )
 
-            # Notify all keg sensors so they recalc units
             for keg_id in list(state.get("data", {}).keys()):
                 hass.bus.async_fire(f"{DOMAIN}_update", {"keg_id": keg_id})
 
@@ -797,9 +830,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.services.async_register(DOMAIN, "set_display_units", set_display_units)
 
         async def on_stop(event) -> None:
-            """Save both history and prefs on shutdown."""
+            """Save history/prefs and cancel background tasks on shutdown."""
             try:
-                await state["history_store"].async_save(state["history"][-MAX_LOG_ENTRIES:])
+                await state["history_store"].async_save(
+                    state["history"][-MAX_LOG_ENTRIES:]
+                )
                 await state["prefs_store"].async_save(
                     {
                         "display_units": state["display_units"],
@@ -813,12 +848,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             except Exception as e:  # pragma: no cover - best effort
                 _LOGGER.warning("%s: failed to persist state on stop: %s", DOMAIN, e)
 
+            # Cancel background tasks (WS loop, pinger, etc.)
+            for task in list(state.get("background_tasks", [])):
+                if not task.done():
+                    task.cancel()
+
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, on_stop)
 
         # ---------- Start after HA is running
 
         async def _start_after_started(event: Any | None = None) -> None:
-            # create entities for platforms
             await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
             try:
@@ -827,17 +866,32 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 for raw in initial:
                     norm = _normalize_keg_dict(raw)
                     await _publish_keg(norm)
-                _LOGGER.info("%s: Initial REST refresh found %d kegs", DOMAIN, len(initial))
+                _LOGGER.info(
+                    "%s: Initial REST refresh found %d kegs",
+                    DOMAIN,
+                    len(initial),
+                )
             except Exception as e:
                 _LOGGER.warning("%s: Initial refresh failed: %s", DOMAIN, e)
 
-            hass.async_create_task(connect_websocket())
-            async_track_time_interval(hass, rest_poll, timedelta(seconds=REST_POLL_SECONDS))
-            async_track_time_interval(hass, watchdog, timedelta(seconds=10))
-            async_track_time_interval(hass, _periodic_devices, timedelta(seconds=DEVICES_REFRESH_SEC))
+            # start websocket loop and track the task
+            ws_task = hass.async_create_task(connect_websocket())
+            state["background_tasks"].append(ws_task)
+
+            async_track_time_interval(
+                hass, rest_poll, timedelta(seconds=REST_POLL_SECONDS)
+            )
+            async_track_time_interval(
+                hass, watchdog, timedelta(seconds=10)
+            )
+            async_track_time_interval(
+                hass, _periodic_devices, timedelta(seconds=DEVICES_REFRESH_SEC)
+            )
 
             # Reset daily_consumed at local midnight
-            async_track_time_change(hass, reset_daily_consumption, hour=0, minute=0, second=0)
+            async_track_time_change(
+                hass, reset_daily_consumption, hour=0, minute=0, second=0
+            )
 
             _LOGGER.info("%s: started background tasks", DOMAIN)
 
@@ -846,7 +900,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         else:
             hass.bus.async_listen_once("homeassistant_started", _start_after_started)
 
-        _LOGGER.info("%s: setup complete (WS+REST+poll+watchdog+devices+services)", DOMAIN)
+        _LOGGER.info(
+            "%s: setup complete (WS+REST+poll+watchdog+devices+services)", DOMAIN
+        )
         return True
 
     except Exception as e:  # pragma: no cover - top-level safety net
@@ -861,3 +917,4 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unloaded and state is not None:
         hass.data[DOMAIN].pop(entry.entry_id, None)
     return unloaded
+
