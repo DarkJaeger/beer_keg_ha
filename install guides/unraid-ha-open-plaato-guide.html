@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Unraid Install Guide - Home Assistant + open-plaato-keg + beer_keg_ha</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    :root {
+      --bg: #0f172a;
+      --bg-alt: #020617;
+      --card-bg: #020617;
+      --accent: #22c55e;
+      --accent-soft: rgba(34, 197, 94, 0.15);
+      --accent-2: #38bdf8;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --border: #1e293b;
+      --code-bg: #020617;
+      --code-border: #1f2933;
+      --kbd-bg: #111827;
+      --kbd-border: #374151;
+      --shadow-soft: 0 18px 45px rgba(15, 23, 42, 0.9);
+      --radius-xl: 18px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+        sans-serif;
+      background: radial-gradient(circle at top, #1f2937 0, #020617 48%, #000 100%);
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    .page {
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      padding: 32px 16px;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 960px;
+      background: linear-gradient(145deg, rgba(15,23,42,0.95), rgba(2,6,23,0.98));
+      border-radius: 24px;
+      box-shadow: var(--shadow-soft);
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      padding: 28px 22px 30px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    @media (min-width: 768px) {
+      .container {
+        padding: 36px 40px 40px;
+      }
+    }
+
+    .glow {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background:
+        radial-gradient(circle at 10% 0%, rgba(56, 189, 248, 0.18) 0, transparent 55%),
+        radial-gradient(circle at 90% 0%, rgba(34, 197, 94, 0.2) 0, transparent 55%);
+      opacity: 0.8;
+    }
+
+    .content {
+      position: relative;
+      z-index: 1;
+    }
+
+    header {
+      margin-bottom: 26px;
+      position: relative;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      border-radius: 999px;
+      padding: 2px 10px 2px 3px;
+      background: rgba(15, 23, 42, 0.9);
+      border: 1px solid rgba(148, 163, 184, 0.5);
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    .badge-dot {
+      width: 18px;
+      height: 18px;
+      border-radius: 999px;
+      background: radial-gradient(circle at 30% 20%, #f5f5f5 0, #22c55e 45%, #166534 100%);
+      box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.3);
+    }
+
+    h1 {
+      font-size: 1.6rem;
+      margin: 0 0 6px;
+      letter-spacing: 0.02em;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+    }
+
+    h1 span.emoji {
+      font-size: 1.5rem;
+      margin-right: 6px;
+    }
+
+    @media (min-width: 768px) {
+      h1 {
+        font-size: 2rem;
+      }
+    }
+
+    .subtitle {
+      font-size: 0.9rem;
+      color: var(--muted);
+      max-width: 600px;
+    }
+
+    .meta {
+      margin-top: 10px;
+      font-size: 0.78rem;
+      color: var(--muted);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .pill {
+      padding: 1px 10px;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.9);
+      border: 1px solid rgba(55, 65, 81, 0.8);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.8fr) minmax(0, 1.2fr);
+      gap: 18px;
+      margin-bottom: 4px;
+    }
+
+    @media (max-width: 880px) {
+      .grid {
+        grid-template-columns: minmax(0, 1fr);
+      }
+    }
+
+    .card {
+      background: radial-gradient(circle at top, #020617 0, #020617 45%, #000 100%);
+      border-radius: var(--radius-xl);
+      border: 1px solid rgba(51, 65, 85, 0.9);
+      padding: 18px 18px 18px;
+      margin-bottom: 14px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .card::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(circle at top right, rgba(56, 189, 248, 0.18), transparent 60%);
+      opacity: 0.7;
+      pointer-events: none;
+    }
+
+    .card-inner {
+      position: relative;
+      z-index: 1;
+    }
+
+    .card h2 {
+      font-size: 1.1rem;
+      margin-top: 0;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .card h2 .num {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 24px;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      color: #020617;
+      font-weight: 700;
+      box-shadow: 0 0 0 2px rgba(15, 23, 42, 0.8);
+    }
+
+    .card p {
+      margin: 0 0 6px;
+      font-size: 0.9rem;
+    }
+
+    .card ul {
+      padding-left: 20px;
+      margin: 6px 0;
+      font-size: 0.9rem;
+    }
+
+    .card li + li {
+      margin-top: 3px;
+    }
+
+    .tag-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 10px;
+    }
+
+    .tag {
+      font-size: 0.75rem;
+      padding: 2px 9px;
+      border-radius: 999px;
+      border: 1px solid rgba(148, 163, 184, 0.5);
+      color: var(--muted);
+      background: rgba(15, 23, 42, 0.9);
+    }
+
+    .tag.primary {
+      border-color: rgba(34, 197, 94, 0.9);
+      color: #bbf7d0;
+      background: rgba(22, 163, 74, 0.12);
+    }
+
+    h3 {
+      font-size: 0.95rem;
+      margin-top: 9px;
+      margin-bottom: 4px;
+      color: #e5e7eb;
+    }
+
+    pre {
+      margin: 8px 0 10px;
+      padding: 10px 12px;
+      background: var(--code-bg);
+      border-radius: 10px;
+      border: 1px solid var(--code-border);
+      overflow-x: auto;
+      font-size: 0.82rem;
+      line-height: 1.5;
+    }
+
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+
+    .kbd {
+      display: inline-block;
+      padding: 1px 5px;
+      margin: 0 1px;
+      font-size: 0.75em;
+      font-family: inherit;
+      border-radius: 4px;
+      border: 1px solid var(--kbd-border);
+      background: var(--kbd-bg);
+      color: var(--muted);
+    }
+
+    .note {
+      font-size: 0.8rem;
+      padding: 6px 9px;
+      border-radius: 10px;
+      background: rgba(15, 23, 42, 0.9);
+      border: 1px dashed rgba(148, 163, 184, 0.6);
+      margin-top: 6px;
+      color: var(--muted);
+    }
+
+    .footer {
+      margin-top: 14px;
+      font-size: 0.8rem;
+      color: var(--muted);
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 8px;
+      border-top: 1px solid rgba(51, 65, 85, 0.8);
+      padding-top: 10px;
+    }
+
+    a {
+      color: var(--accent-2);
+    }
+
+    @media print {
+      body {
+        background: #ffffff;
+        color: #000000;
+      }
+      .page {
+        padding: 0;
+      }
+      .container {
+        max-width: 100%;
+        border-radius: 0;
+        border: none;
+        box-shadow: none;
+      }
+      .glow {
+        display: none;
+      }
+      .card {
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+      }
+      .note {
+        background: #f9fafb;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="container">
+      <div class="glow"></div>
+      <div class="content">
+        <header>
+          <div class="badge">
+            <span class="badge-dot"></span>
+            Unraid · Home Assistant · Keg Telemetry
+          </div>
+          <h1>
+            <span class="emoji">🍺</span>
+            Home Assistant + open-plaato-keg + beer_keg_ha on Unraid
+          </h1>
+          <p class="subtitle">
+            Step-by-step guide for installing Home Assistant and the open-plaato-keg
+            server on Unraid using Docker Compose Manager, then wiring it up to
+            the <code>beer_keg_ha</code> integration and your keg scales.
+          </p>
+          <div class="meta">
+            <span class="pill">Stack 1: <strong>HA</strong> (Home Assistant)</span>
+            <span class="pill">Stack 2: <strong>open_plaato_keg</strong> (Keg server)</span>
+            <span class="pill">Integration: <code>beer_keg_ha</code></span>
+          </div>
+        </header>
+
+        <div class="grid">
+          <!-- LEFT COLUMN -->
+          <div>
+            <!-- STEP 1 -->
+            <section class="card">
+              <div class="card-inner">
+                <h2><span class="num">1</span> Install Docker Compose Manager for Unraid</h2>
+                <p>
+                  Docker Compose Manager lets you define and manage multi-container
+                  stacks (Compose files) directly from the Unraid UI.
+                </p>
+                <h3>Steps</h3>
+                <ul>
+                  <li>Open the <span class="kbd">Unraid Web UI</span>.</li>
+                  <li>Go to <span class="kbd">Apps</span> (Community Applications).</li>
+                  <li>Search for <strong>Docker Compose Manager</strong> (or similar name).</li>
+                  <li>Click <strong>Install</strong>.</li>
+                  <li>
+                    After installation, access it from:
+                    <ul>
+                      <li><span class="kbd">Settings → Docker Compose Manager</span> or</li>
+                      <li>a dedicated <span class="kbd">Compose</span> / <span class="kbd">Stacks</span> entry under Docker.</li>
+                    </ul>
+                  </li>
+                </ul>
+                <div class="note">
+                  You’ll use Docker Compose Manager to create two stacks:
+                  <strong>HA</strong> (Home Assistant) and
+                  <strong>open_plaato_keg</strong> (keg server).
+                </div>
+              </div>
+            </section>
+
+            <!-- STEP 2 -->
+            <section class="card">
+              <div class="card-inner">
+                <h2><span class="num">2</span> Install Home Assistant – Stack <code>HA</code></h2>
+                <p>
+                  This stack runs Home Assistant using the official container image,
+                  with configuration stored on your Unraid array via
+                  <code>${CONFIG_PATH}</code>.
+                </p>
+
+                <h3>2.1 Create the <code>HA</code> stack</h3>
+                <ul>
+                  <li>Open <span class="kbd">Click on Docker from the unraid dashboard next to apps.</span> in Unraid.</li>
+                  <li>Click <strong>Add New Stack</strong>.</li>
+                  <li>Set the stack name to <strong>HA</strong>.</li>
+                  <li>Click ok and ok again on popup box</li>
+                  <li>Click ok gear next to your new HA stack</li>
+                  <li>Click on edit stack</li>
+                  <li>Click on compose file</li>
+                  <li>Paste the following compose content:</li>
+                  <li>Then click save changes </li>
+                  <li>Click on ok on the popup box</li>
+                </ul>
+
+<pre><code>version: "3.8"
+
+services:
+  # Home Assistant: Open source home automation platform that puts local control and privacy first.
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: ${CONTAINER_PREFIX}homeassistant
+    environment:
+      - TZ=${TZ}
+    volumes:
+      - ${CONFIG_PATH}/homeassistant:/config
+      - /etc/localtime:/etc/localtime:ro
+      - /run/dbus:/run/dbus:ro
+    ports:
+      - 8123:8123
+    restart: ${RESTART_POLICY}
+    privileged: true
+</code></pre>
+
+                <div class="note">
+                  This compose file uses environment variables:
+                  <code>CONTAINER_PREFIX</code>, <code>TZ</code>,
+                  <code>CONFIG_PATH</code>, <code>RESTART_POLICY</code>.
+                  We define them next in a <code>.env</code> file for this stack.
+                </div>
+
+                <h3>2.2 Create the <code>.env</code> file</h3>
+                <ul>>
+                <li>Click ok gear next to your new HA stack</li>
+                  <li>Click on edit stack</li>
+                  <li>Click on env file</li>
+                  <li>Paste the following env content:</li>
+                  <li>Then click save changes </li>
+                </ul>
+<pre><code>CONTAINER_PREFIX=ha_
+TZ=America/New_York
+CONFIG_PATH=/mnt/user/appdata
+RESTART_POLICY=unless-stopped
+</code></pre>
+
+                <ul>
+                  <li>Adjust <code>TZ</code> to your actual timezone.</li>
+                  <li>
+                    Ensure <code>CONFIG_PATH</code> points to your appdata location
+                    (commonly <code>/mnt/user/appdata</code> on Unraid).
+                  </li>
+                </ul>
+
+                <h3>2.3 Deploy the stack</h3>
+                <ul>
+                  <li>Click <strong>Compose Up</strong> / <strong>Apply</strong> on the <strong>HA</strong> stack.</li>
+                  <li>Wait until the <code>homeassistant</code> container shows as <strong>running</strong>.</li>
+                  <li>
+                    Open Home Assistant in your browser:
+                    <pre><code>http://UNRAID-IP:8123</code></pre>
+                  </li>
+                  <li>Complete the initial setup (user, password, basic config).</li>
+                </ul>
+
+                <div class="tag-row">
+                  <span class="tag primary">Stack: HA</span>
+                  <span class="tag">Port 8123</span>
+                  <span class="tag">Host-mode container</span>
+                </div>
+              </div>
+            </section>
+
+            <!-- STEP 3 -->
+            <section class="card">
+              <div class="card-inner">
+                <h2><span class="num">3</span> Install open-plaato-keg server – Stack <code>open_plaato_keg</code></h2>
+                <p>
+                  The open-plaato-keg server receives telemetry from your keg scales,
+                  stores it, and exposes an HTTP API for integrations like
+                  <code>beer_keg_ha</code>.
+                </p>
+
+                <h3>3.1 Create the <code>open_plaato_keg</code> stack</h3>
+                <ul>
+                  <li>In Docker Manager, click <strong>Add New Stack</strong>.</li>
+                  <li>Name it <strong>open_plaato_keg</strong>.</li>
+                  <li>Click ok and ok again on popup box</li>
+                  <li>Click ok gear next to your new open_plaato_keg stack</li>
+                  <li>Click on edit stack</li>
+                  <li>Click on compose file</li>
+                  <li>Paste the following compose content:</li>
+                  <li>Then click save changes </li>
+                  <li>Click on ok on the popup box</li>
+                </ul>
+
+<pre><code>version: "3.8"
+
+services:
+  open_plaato_keg:
+    image: ghcr.io/sklopivo/open-plaato-keg:latest
+    container_name: open_plaato_keg
+    ports:
+      - 1234:1234
+      - 8085:8085
+    restart: always
+    environment:
+      - DATABASE_FILE_PATH=/db/keg_data.bin
+      - KEG_LISTENER_PORT=1234
+      - HTTP_LISTENER_PORT=8085
+    volumes:
+      - /mnt/user/appdata/open_plaato_keg:/db
+</code></pre>
+
+                <div class="note">
+                  The volume <code>/mnt/user/appdata/open_plaato_keg:/db</code> ensures
+                  your keg DB file (<code>keg_data.bin</code>) persists across
+                  container restarts.
+                </div>
+
+                <h3>3.2 Deploy the stack</h3>
+                <ul>
+                  <li>Click <strong>Compose Up</strong> / <strong>Apply</strong>.</li>
+                  <li>
+                    Once running, access the server's HTTP UI:
+                    <pre><code>http://UNRAID-IP:8085/index.html</code></pre>
+                  </li>
+                  <li>
+                    The server listens for keg data on:
+                    <pre><code>UNRAID-IP:1234</code></pre>
+                  </li>
+                </ul>
+
+                <div class="tag-row">
+                  <span class="tag primary">Stack: open_plaato_keg</span>
+                  <span class="tag">Keg listener: 1234</span>
+                  <span class="tag">HTTP UI: 8085</span>
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <!-- RIGHT COLUMN -->
+          <div>
+            <!-- STEP 4 -->
+            <section class="card">
+              <div class="card-inner">
+                <h2><span class="num">4</span> Install HACS in Home Assistant</h2>
+                <p>
+                  HACS (Home Assistant Community Store) is used to install the
+                  <code>beer_keg_ha</code> integration.
+                </p>
+
+                <h3>4.1 Install the SSH & Web Terminal add-on</h3>
+                <ul>
+                  <li>In Home Assistant, go to <span class="kbd">Settings → Add-ons → Add-on Store</span>.</li>
+                  <li>Search for <strong>SSH &amp; Web Terminal</strong>.</li>
+                  <li>Install the add-on and click <strong>Start</strong>.</li>
+                </ul>
+
+                <h3>4.2 Install HACS via shell</h3>
+                <ul>
+                  <li>Open the SSH / Terminal add-on web UI.</li>
+                  <li>Run the official HACS install script:</li>
+                </ul>
+
+<pre><code>wget -O - https://get.hacs.xyz | bash -
+</code></pre>
+
+                <ul>
+                  <li>When finished, restart Home Assistant.</li>
+                </ul>
+
+                <h3>4.3 Finalize HACS setup</h3>
+                <ul>
+                  <li>Go to <span class="kbd">Settings → Devices &amp; Services</span>.</li>
+                  <li>Click <strong>+ Add Integration</strong>.</li>
+                  <li>Search for <strong>HACS</strong> and follow the GitHub authentication flow.</li>
+                  <li>After setup, HACS will appear in the left sidebar.</li>
+                </ul>
+
+                <div class="tag-row">
+                  <span class="tag primary">HACS installed</span>
+                  <span class="tag">Required for beer_keg_ha</span>
+                </div>
+              </div>
+            </section>
+
+            <!-- STEP 5 -->
+<section class="card">
+  <div class="card-inner">
+    <h2><span class="num">5</span> Install <code>beer_keg_ha</code> via HACS (Custom Repo)</h2>
+    <p>
+      The <code>beer_keg_ha</code> integration must be installed using a
+      custom HACS repository before it will appear in the integration list.
+    </p>
+
+    <h3>5.1 Add Custom Repository</h3>
+    <ul>
+      <li>Home Assistant → <span class="kbd">HACS</span> → <span class="kbd">Integrations</span></li>
+      <li>Click the <span class="kbd">3-dot menu</span> → <strong>Custom repositories</strong></li>
+      <li>Add the following:</li>
+    </ul>
+
+<pre><code>Repository: https://github.com/DarkJaeger/beer_keg_ha
+Type: Integration
+</code></pre>
+
+    <h3>5.2 Install from HACS</h3>
+    <ul>
+      <li>Search for <strong>“Beer Keg Scale”</strong></li>
+      <li>Click <strong>Install</strong></li>
+      <li><strong>Restart Home Assistant</strong> after installation</li>
+    </ul>
+
+    <h3>5.3 Add Integration</h3>
+    <ul>
+      <li>Go to <span class="kbd">Settings → Devices & Services</span></li>
+      <li>Click <strong>+ Add Integration</strong></li>
+      <li>Search for <strong>Beer Keg Scale</strong></li>
+      <li>Follow the wizard to set it up</li>
+    </ul>
+
+    <h3>5.4 Configure Integration</h3>
+    <p>During setup or after installation, configure the following:</p>
+
+    <ul>
+      <li><strong>WebSocket URL</strong>:<br>
+      <code>ws://&lt;host&gt;:8085/ws</code><br>
+      (Replace <code>&lt;host&gt;</code> with your Unraid server IP.)</li>
+
+      <li><strong>Empty keg weight (kg)</strong>: usually <code>0</code> if you tare an empty keg</li>
+
+      <li><strong>Full volume (L)</strong>: e.g. <code>19.0</code></li>
+
+      <li><strong>Beer SG</strong>: e.g. <code>1.010</code> (finished beer typical value)</li>
+
+      <li><strong>Default full weight (kg)</strong>: fallback if needed</li>
+
+      <li><strong>Per-keg full weights JSON</strong>:<br>
+      <pre><code>{ "keg_id": 19.0 }</code></pre>
+      </li>
+    </ul>
+
+    <p><strong>Restart Home Assistant</strong> after saving configuration options.</p>
+
+    <div class="tag-row">
+      <span class="tag primary">beer_keg_ha installed</span>
+      <span class="tag">Uses WebSocket ws://host:8085/ws</span>
+    </div>
+  </div>
+</section>
+
+            <!-- STEP 6 -->
+            <section class="card">
+              <div class="card-inner">
+                <h2><span class="num">6</span> Configure scales to use open-plaato-keg server</h2>
+                <p>
+                  Finally, point each keg scale (Plaato-style or DIY) to your
+                  open-plaato-keg server so it can receive and store live keg
+                  telemetry.
+                </p>
+
+                <h3>6.1 Enter AP mode and connect</h3>
+                <ul>
+                  <li>Power on the scale and put it into AP / configuration mode.</li>
+                  <li>Connect to its WiFi network (often named like <code>PLAATO-XXXXX</code>).</li>
+                </ul>
+
+                <h3>6.2 Open the configuration page</h3>
+                <ul>
+                  <li>In a browser, go to:
+                    <pre><code>http://192.168.4.1</code></pre>
+                  </li>
+                  <li>You should see a configuration form with fields like:
+                    <ul>
+                      <li>WiFi SSID</li>
+                      <li>WiFi Password</li>
+                      <li>Auth Token</li>
+                      <li>Host</li>
+                      <li>Port</li>
+                    </ul>
+                  </li>
+                </ul>
+
+                <h3>6.3 Configure network and server details</h3>
+                <p>Fill in the form as follows:</p>
+                <ul>
+                  <li><strong>WiFi SSID</strong>: your 2.4&nbsp;GHz WiFi network name.</li>
+                  <li><strong>WiFi Password</strong>: your WiFi password.</li>
+                  <li><strong>Host</strong>: your Unraid server IP (where the open-plaato-keg container runs).</li>
+                  <li><strong>Port</strong>: <code>1234</code> (the keg listener port defined in your compose file).</li>
+                  <li><strong>Token</strong>: a 32-character hex string (if required by your firmware / server configuration).</li>
+                </ul>
+
+<pre><code>Example:
+Host: 192.168.8.50
+Port: 1234
+Token: 1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d
+</code></pre>
+
+                <h3>6.4 Save & reboot</h3>
+                <ul>
+                  <li>Click <strong>Save</strong> on the config page.</li>
+                  <li>Allow the scale to reboot and join your main WiFi.</li>
+                  <li>
+                    Once online, it will start sending keg data to:
+                    <pre><code>UNRAID-IP:1234</code></pre>
+                  </li>
+                  <li>
+                    The open-plaato-keg server will persist this to its DB
+                    (<code>/db/keg_data.bin</code>), and
+                    <code>beer_keg_ha</code> will surface it as sensors in Home Assistant.
+                  </li>
+                </ul>
+
+                <div class="tag-row">
+                  <span class="tag primary">Scales connected</span>
+                  <span class="tag">Live keg telemetry</span>
+                </div>
+                     
+
+        
+      </div>
+    </div>
+  </div>
+</body>
+</html>
