@@ -16,7 +16,10 @@ _LOGGER = logging.getLogger(__name__)
 PLATFORM_EVENT = f"{DOMAIN}_update"
 DEVICES_UPDATE_EVENT = f"{DOMAIN}_devices_update"
 
-# Global unit selects for the integration
+# -------------------------------------------------------------------
+# GLOBAL UNIT SELECTS
+# -------------------------------------------------------------------
+
 UNIT_SELECTS: Dict[str, Dict[str, Any]] = {
     "weight": {
         "name": "Keg Weight Unit",
@@ -32,13 +35,27 @@ UNIT_SELECTS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# (Metadata for the per-keg smoothing select – not strictly required,
+#  but kept here for clarity.)
+KEG_SELECT_TYPES: Dict[str, Dict[str, Any]] = {
+    "smoothing_mode": {
+        "key": "disable_smoothing",
+        "name": "Smoothing Mode",
+        "options": ["Normal", "Off"],
+    },
+}
+
+
+# -------------------------------------------------------------------
+# SETUP
+# -------------------------------------------------------------------
 
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up device + unit selects for the Beer Keg integration."""
+    """Set up device + unit selects + per-keg smoothing selects."""
     state = hass.data[DOMAIN][entry.entry_id]
 
     entities: List[SelectEntity] = []
@@ -50,8 +67,41 @@ async def async_setup_entry(
     for unit_kind in UNIT_SELECTS.keys():
         entities.append(BeerKegUnitSelect(hass, entry, unit_kind))
 
+    # 3) Per-keg smoothing select (Normal / Off)
+    created = state.setdefault("created_select_kegs", set())
+
+    def create_for(keg_id: str) -> None:
+        if keg_id in created:
+            return
+        entities.append(BeerKegSmoothingSelect(hass, entry, keg_id))
+        created.add(keg_id)
+
+    # Existing kegs
+    for keg_id in list(state.get("data", {}).keys()):
+        create_for(keg_id)
+
+    # Add initial entities (device + units + any existing keg smoothing selects)
     async_add_entities(entities, True)
 
+    # When new kegs appear, create smoothing selects for them
+    @callback
+    def _on_update(event) -> None:
+        keg_id = (event.data or {}).get("keg_id")
+        if not keg_id or keg_id in created:
+            return
+
+        new_ent = BeerKegSmoothingSelect(hass, entry, keg_id)
+        created.add(keg_id)
+        async_add_entities([new_ent], True)
+
+    entry.async_on_unload(
+        hass.bus.async_listen(PLATFORM_EVENT, _on_update)
+    )
+
+
+# -------------------------------------------------------------------
+# DEVICE SELECT (select.keg_device)
+# -------------------------------------------------------------------
 
 class BeerKegDeviceSelect(SelectEntity):
     """Select entity listing all keg devices discovered by the integration."""
@@ -86,8 +136,6 @@ class BeerKegDeviceSelect(SelectEntity):
             model="WebSocket + REST",
         )
 
-    # ---- SelectEntity core ----
-
     @property
     def options(self) -> list[str]:
         """Return list of keg device IDs known by the integration."""
@@ -108,7 +156,11 @@ class BeerKegDeviceSelect(SelectEntity):
     async def async_select_option(self, option: str) -> None:
         """Handle user picking a keg from the dropdown."""
         if option not in self.options:
-            _LOGGER.warning("%s: Attempt to select unknown keg device: %s", DOMAIN, option)
+            _LOGGER.warning(
+                "%s: Attempt to select unknown keg device: %s",
+                DOMAIN,
+                option,
+            )
             return
 
         self._state_ref["selected_device"] = option
@@ -127,6 +179,10 @@ class BeerKegDeviceSelect(SelectEntity):
             self.hass.bus.async_listen(DEVICES_UPDATE_EVENT, _handle_devices_update)
         )
 
+
+# -------------------------------------------------------------------
+# GLOBAL UNIT SELECTS
+# -------------------------------------------------------------------
 
 class BeerKegUnitSelect(SelectEntity):
     """Global select entity to control display units (weight/temp/pour)."""
@@ -202,7 +258,16 @@ class BeerKegUnitSelect(SelectEntity):
         # Persist preferences if prefs_store exists
         prefs_store = domain_state.get("prefs_store")
         if prefs_store is not None:
-            await prefs_store.async_save({"display_units": du})
+            await prefs_store.async_save(
+                {
+                    "display_units": domain_state.get("display_units", {}),
+                    "keg_config": domain_state.get("keg_config", {}),
+                    "tap_text": domain_state.get("tap_text", {}),
+                    "tap_numbers": domain_state.get("tap_numbers", {}),
+                    "noise_deadband_kg": domain_state.get("noise_deadband_kg"),
+                    "smoothing_alpha": domain_state.get("smoothing_alpha"),
+                }
+            )
 
         # Notify all keg sensors so they recalc units
         for keg_id in list(domain_state.get("data", {}).keys()):
@@ -224,3 +289,70 @@ class BeerKegUnitSelect(SelectEntity):
         self.async_on_remove(
             self.hass.bus.async_listen(PLATFORM_EVENT, _handle_update)
         )
+
+
+# -------------------------------------------------------------------
+# PER-KEG SMOOTHING SELECT
+# -------------------------------------------------------------------
+
+class BeerKegSmoothingSelect(SelectEntity):
+    """Per-keg select to turn smoothing on/off."""
+
+    _attr_should_poll = False
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, keg_id: str) -> None:
+        self.hass = hass
+        self.entry = entry
+        self.keg_id = keg_id
+        self._state_ref = hass.data[DOMAIN][entry.entry_id]
+
+        self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}_{keg_id}_smoothing_mode"
+        self._attr_name = f"Keg {keg_id[:4]} Smoothing"
+        self._attr_options = ["Normal", "Off"]
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"{self.entry.entry_id}_{self.keg_id}")},
+            name=f"Beer Keg {self.keg_id[:4]}",
+            manufacturer="Beer Keg",
+        )
+
+    @property
+    def current_option(self) -> str:
+        keg_cfg_all: Dict[str, Dict[str, Any]] = self._state_ref.setdefault(
+            "keg_config", {}
+        )
+        keg_cfg: Dict[str, Any] = keg_cfg_all.get(self.keg_id, {})
+        disable = bool(keg_cfg.get("disable_smoothing", False))
+        return "Off" if disable else "Normal"
+
+    async def async_select_option(self, option: str) -> None:
+        keg_cfg_all: Dict[str, Dict[str, Any]] = self._state_ref.setdefault(
+            "keg_config", {}
+        )
+        keg_cfg: Dict[str, Any] = keg_cfg_all.setdefault(self.keg_id, {})
+
+        # True when Off, False when Normal
+        keg_cfg["disable_smoothing"] = (option == "Off")
+
+        # persist along with other prefs
+        prefs = self._state_ref.get("prefs_store")
+        if prefs:
+            await prefs.async_save(
+                {
+                    "display_units": self._state_ref.get("display_units", {}),
+                    "keg_config": self._state_ref.get("keg_config", {}),
+                    "tap_text": self._state_ref.get("tap_text", {}),
+                    "tap_numbers": self._state_ref.get("tap_numbers", {}),
+                    "noise_deadband_kg": self._state_ref.get("noise_deadband_kg"),
+                    "smoothing_alpha": self._state_ref.get("smoothing_alpha"),
+                }
+            )
+
+        # nudge that keg so UI updates with new behavior immediately
+        self.hass.bus.async_fire(
+            PLATFORM_EVENT,
+            {"keg_id": self.keg_id},
+        )
+        self.async_write_ha_state()

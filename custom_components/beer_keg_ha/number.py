@@ -8,6 +8,7 @@ from homeassistant.components.number import (
     NumberMode,
 )
 from homeassistant.config_entries import ConfigEntry
+    #  - full_weight / weight_calibrate: kg
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -82,7 +83,8 @@ GLOBAL_NUMBER_TYPES: Dict[str, Dict[str, Any]] = {
         "max": 0.5,
         "step": 0.01,
         "mode": NumberMode.SLIDER,
-        "default": 0.00,
+        # 👉 Match __init__.py default
+        "default": 0.0,
     },
     "smoothing_alpha": {
         "name": "Beer Keg Smoothing Alpha",
@@ -91,7 +93,8 @@ GLOBAL_NUMBER_TYPES: Dict[str, Dict[str, Any]] = {
         "max": 1.0,
         "step": 0.05,
         "mode": NumberMode.SLIDER,
-        "default": 0.1,
+        # 👉 Match __init__.py default (no extra smoothing)
+        "default": 1.0,
     },
 }
 
@@ -109,6 +112,7 @@ async def async_setup_entry(
     #
     # 1) Global smoothing sliders (once per integration entry)
     #
+    # If __init__ already set these (from options/prefs), setdefault will NOT overwrite.
     state.setdefault(
         "noise_deadband_kg",
         GLOBAL_NUMBER_TYPES["noise_deadband_kg"]["default"],
@@ -185,6 +189,12 @@ class BeerKegGlobalNumberEntity(NumberEntity):
         self._attr_native_max_value = meta["max"]
         self._attr_native_step = meta["step"]
 
+        # cosmetic: only noise_deadband has a real unit
+        if self._state_key == "noise_deadband_kg":
+            self._attr_native_unit_of_measurement = "kg"
+        else:
+            self._attr_native_unit_of_measurement = None
+
     @property
     def device_info(self) -> DeviceInfo:
         """Group these under a 'Beer Keg Settings' device."""
@@ -207,6 +217,20 @@ class BeerKegGlobalNumberEntity(NumberEntity):
     async def async_set_native_value(self, value: float) -> None:
         domain_state = self.hass.data[DOMAIN][self.entry.entry_id]
         domain_state[self._state_key] = float(value)
+
+        # Persist along with other prefs (tap text, tap numbers, etc)
+        prefs = domain_state.get("prefs_store")
+        if prefs:
+            await prefs.async_save(
+                {
+                    "display_units": domain_state.get("display_units", {}),
+                    "keg_config": domain_state.get("keg_config", {}),
+                    "tap_text": domain_state.get("tap_text", {}),
+                    "tap_numbers": domain_state.get("tap_numbers", {}),
+                    "noise_deadband_kg": domain_state.get("noise_deadband_kg"),
+                    "smoothing_alpha": domain_state.get("smoothing_alpha"),
+                }
+            )
 
         # Nudge all kegs so sensors recalc with new smoothing
         for keg_id in list(domain_state.get("data", {}).keys()):
@@ -308,3 +332,4 @@ class BeerKegNumberEntity(NumberEntity):
         self.async_on_remove(
             self.hass.bus.async_listen(PLATFORM_EVENT, _handle_update)
         )
+

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Set
 
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 
@@ -15,7 +16,10 @@ _LOGGER = logging.getLogger(__name__)
 
 PLATFORM_EVENT = f"{DOMAIN}_update"
 
-# Base + display sensor definitions.
+# -------------------------------------------------------------------
+# SENSOR DEFINITIONS
+# -------------------------------------------------------------------
+
 # "unit" here is the *native* unit our integration stores,
 # not necessarily what we want to *display*.
 SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
@@ -39,11 +43,11 @@ SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
 
     # --- DISPLAY SENSORS (follow display_units; no HA auto-conversion) ---
     "weight_display": {
-        "unit": None,              # set dynamically
+        "unit": None,  # set dynamically
         "name": "Weight (Display)",
         "key": "weight",
         "icon": "mdi:scale",
-        "device_class": None,      # avoid HA unit coercion
+        "device_class": None,  # avoid HA unit coercion
         "state_class": "measurement",
     },
     "temperature_display": {
@@ -138,6 +142,10 @@ SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
 }
 
 
+# -------------------------------------------------------------------
+# SETUP
+# -------------------------------------------------------------------
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -147,12 +155,17 @@ async def async_setup_entry(
     state = hass.data[DOMAIN][entry.entry_id]
     created: Set[str] = state.setdefault("created_kegs", set())
 
+    entities: List[SensorEntity] = []
+
+    # One debug sensor per config entry
+    entities.append(BeerKegDebugSensor(hass, entry))
+
     def create_for(keg_id: str) -> None:
-        # Create all sensors (raw + display) for one keg_id (once).
+        """Create all sensors (raw + display) for one keg_id (once)."""
         if keg_id in created:
             return
 
-        ents: List[KegSensor] = [
+        ents: List[SensorEntity] = [
             KegSensor(hass, entry, keg_id, sensor_key)
             for sensor_key in SENSOR_TYPES.keys()
         ]
@@ -163,16 +176,23 @@ async def async_setup_entry(
     for keg_id in list(state.get("data", {}).keys()):
         create_for(keg_id)
 
+    # add the debug sensor
+    async_add_entities(entities, True)
+
     @callback
     def _on_update(event) -> None:
         """Handle keg update events from the integration."""
         keg_id = (event.data or {}).get("keg_id")
         if keg_id:
             create_for(keg_id)
-            # existing sensors for this keg will also be nudged by their own listeners
+            # existing sensors for this keg will be nudged by their own listeners
 
     entry.async_on_unload(hass.bus.async_listen(PLATFORM_EVENT, _on_update))
 
+
+# -------------------------------------------------------------------
+# PER-KEG SENSOR
+# -------------------------------------------------------------------
 
 class KegSensor(SensorEntity):
     """One logical sensor (weight/temp/etc.) for a specific keg."""
@@ -247,6 +267,7 @@ class KegSensor(SensorEntity):
         units = self._get_display_units()
 
         # ========== RAW FIXED-UNIT SENSORS ==========
+
         if self.sensor_type == "weight":
             # Always base kg for HA
             try:
@@ -350,3 +371,74 @@ class KegSensor(SensorEntity):
         if (event.data or {}).get("keg_id") == self.keg_id:
             # Recompute native_value + native_unit_of_measurement
             self.async_write_ha_state()
+
+
+# -------------------------------------------------------------------
+# DEBUG SENSOR
+# -------------------------------------------------------------------
+
+class BeerKegDebugSensor(SensorEntity):
+    """Diagnostic sensor for Beer Keg integration."""
+
+    _attr_should_poll = False
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        self.hass = hass
+        self.entry = entry
+
+        self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}_debug"
+        self._attr_name = "Beer Keg Debug"
+        self._attr_icon = "mdi:bug"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Group under the settings device."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"{self.entry.entry_id}_settings")},
+            name="Beer Keg Settings",
+            manufacturer="Beer Keg",
+            model="WebSocket + REST",
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        """
+        Show 'seconds since last update' as the main sensor value.
+        None = no update yet.
+        """
+        state = self.hass.data[DOMAIN][self.entry.entry_id]
+        ts = state.get("last_update_ts")
+        if not isinstance(ts, datetime):
+            return None
+        age = (datetime.now(timezone.utc) - ts).total_seconds()
+        return round(age, 1)
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Expose WS URL, smoothing config, and selected keg smoothing state."""
+        state = self.hass.data[DOMAIN][self.entry.entry_id]
+
+        ws_url = state.get("ws_url")
+        noise_deadband = state.get("noise_deadband_kg")
+        smoothing_alpha = state.get("smoothing_alpha")
+
+        selected = state.get("selected_device")
+        keg_cfg_all: Dict[str, Dict[str, Any]] = state.get("keg_config", {}) or {}
+        keg_cfg = keg_cfg_all.get(selected, {}) if selected else {}
+
+        kegs_runtime: Dict[str, Any] = state.get("kegs", {}) or {}
+        runtime = kegs_runtime.get(selected, {}) if selected else {}
+
+        return {
+            "ws_url": ws_url,
+            "noise_deadband_kg": noise_deadband,
+            "smoothing_alpha": smoothing_alpha,
+            "devices": list(state.get("devices", [])),
+            "selected_device": selected,
+            "selected_disable_smoothing": bool(
+                keg_cfg.get("disable_smoothing", False)
+            ),
+            "selected_last_weight_raw": runtime.get("last_weight_raw"),
+            "selected_last_weight_filtered": runtime.get("filtered_weight"),
+            "selected_last_pour_oz": runtime.get("last_pour"),
+        }

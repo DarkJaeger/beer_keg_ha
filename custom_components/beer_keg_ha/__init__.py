@@ -162,8 +162,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "pour": "oz",    # last_pour / daily_consumption base unit
             },
             # Global smoothing config (overridable via Number entities)
-            "noise_deadband_kg": float(opts.get("noise_deadband_kg", 0.05)),
-            "smoothing_alpha": float(opts.get("smoothing_alpha", 0.3)),
+            "tap_text": {},      # will be overridden by prefs if present
+            "tap_numbers": {},   # "
+            "noise_deadband_kg": float(opts.get("noise_deadband_kg", 0.0)),
+            "smoothing_alpha": float(opts.get("smoothing_alpha", 1.0)),
             # Optional per-keg config that should survive restart
             # (e.g. name override, beer_sg, original_gravity, kegged_date, expiration_date)
             "keg_config": {},
@@ -180,7 +182,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             state["history"] = loaded_history
             _LOGGER.info("%s: Loaded %d pour records", DOMAIN, len(state["history"]))
 
-        # ---- load prefs (display_units + keg_config) from storage
+        # ---- load prefs (display_units + keg_config + tap_text + tap_numbers + smoothing) from storage
         loaded_prefs = await prefs_store.async_load()
         if isinstance(loaded_prefs, dict):
             du = loaded_prefs.get("display_units")
@@ -194,6 +196,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     state["display_units"]["temp"] = t
                 if p in ("oz", "ml"):
                     state["display_units"]["pour"] = p
+
             keg_cfg = loaded_prefs.get("keg_config")
             if isinstance(keg_cfg, dict):
                 norm_cfg: Dict[str, Dict[str, Any]] = {}
@@ -202,6 +205,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     if isinstance(v, dict):
                         norm_cfg[keg_id] = v
                 state["keg_config"] = norm_cfg
+
+            # restore tap text / numbers
+            tap_text = loaded_prefs.get("tap_text")
+            if isinstance(tap_text, dict):
+                state["tap_text"] = tap_text
+
+            tap_numbers = loaded_prefs.get("tap_numbers")
+            if isinstance(tap_numbers, dict):
+                state["tap_numbers"] = tap_numbers
+
+            # restore per-entry smoothing settings
+            ndb = loaded_prefs.get("noise_deadband_kg")
+            if isinstance(ndb, (int, float)):
+                state["noise_deadband_kg"] = float(ndb)
+
+            sa = loaded_prefs.get("smoothing_alpha")
+            if isinstance(sa, (int, float)):
+                state["smoothing_alpha"] = float(sa)
+        # ---- end load prefs
 
         # ---------- REST helpers
 
@@ -290,27 +312,34 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             is_pour = raw_delta > state.get("pour_threshold", DEFAULT_POUR_THRESHOLD)
             info["last_weight_raw"] = weight_raw
 
+            # ---------- CHECK PER-KEG BYPASS FLAG ----------
+            keg_cfg = state.get("keg_config", {}).get(keg_id, {}) or {}
+            bypass_smoothing = bool(keg_cfg.get("disable_smoothing", False))
+
             # ---------- SMOOTHING ----------
             display_weight = weight_raw
-            if not is_pour:
+            if not is_pour and not bypass_smoothing:
                 recent = info.setdefault("recent_weights", [])
                 recent.append(weight_raw)
                 if len(recent) > 5:
                     recent.pop(0)
 
                 median_kg = sorted(recent)[len(recent) // 2]
-                alpha = float(state.get("smoothing_alpha", 0.3))
-                alpha = alpha if 0 < alpha <= 1 else 0.3
+
+                alpha = float(state.get("smoothing_alpha", 1.0))
+                if not (0 < alpha <= 1):
+                    alpha = 1.0
                 previous_filtered = info.get("filtered_weight", median_kg)
                 filtered = (alpha * median_kg) + ((1 - alpha) * previous_filtered)
 
-                deadband = float(state.get("noise_deadband_kg", 0.05))
+                deadband = float(state.get("noise_deadband_kg", 0.0))
                 if abs(filtered - previous_filtered) < deadband:
                     filtered = previous_filtered
 
                 display_weight = filtered
                 info["filtered_weight"] = filtered
             else:
+                # During pours OR when bypass_smoothing is True, use raw weight
                 info["filtered_weight"] = weight_raw
 
             info["last_weight"] = display_weight
@@ -391,7 +420,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 hass.bus.async_fire(DEVICES_UPDATE_EVENT, {"ids": list(state["devices"])})
 
             hass.bus.async_fire(f"{DOMAIN}_update", {"keg_id": keg_id})
-
 
         # ---------- WebSocket loop
 
@@ -711,7 +739,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.error("%s: calibrate_keg failed: %s", DOMAIN, e)
                 pn_create(hass, f"Calibration failed: {e}", title="Beer Keg")
 
-
         hass.services.async_register(DOMAIN, "calibrate_keg", calibrate_keg)
 
         async def set_display_units(call: ServiceCall) -> None:
@@ -745,11 +772,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "pour": pour_unit,
             }
 
-            # Persist so it survives reboot (along with keg_config)
+            # Persist so it survives reboot (along with all other prefs)
             await state["prefs_store"].async_save(
                 {
                     "display_units": state["display_units"],
                     "keg_config": state.get("keg_config", {}),
+                    "tap_text": state.get("tap_text", {}),
+                    "tap_numbers": state.get("tap_numbers", {}),
+                    "noise_deadband_kg": state.get("noise_deadband_kg"),
+                    "smoothing_alpha": state.get("smoothing_alpha"),
                 }
             )
 
@@ -773,6 +804,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     {
                         "display_units": state["display_units"],
                         "keg_config": state.get("keg_config", {}),
+                        "tap_text": state.get("tap_text", {}),
+                        "tap_numbers": state.get("tap_numbers", {}),
+                        "noise_deadband_kg": state.get("noise_deadband_kg"),
+                        "smoothing_alpha": state.get("smoothing_alpha"),
                     }
                 )
             except Exception as e:  # pragma: no cover - best effort
@@ -801,9 +836,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             async_track_time_interval(hass, watchdog, timedelta(seconds=10))
             async_track_time_interval(hass, _periodic_devices, timedelta(seconds=DEVICES_REFRESH_SEC))
 
-             # Reset daily_consumed at local midnight
+            # Reset daily_consumed at local midnight
             async_track_time_change(hass, reset_daily_consumption, hour=0, minute=0, second=0)
-            
+
             _LOGGER.info("%s: started background tasks", DOMAIN)
 
         if hass.state == "RUNNING":
