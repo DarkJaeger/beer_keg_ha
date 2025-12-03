@@ -217,6 +217,59 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if isinstance(loaded_history, list):
             state["history"] = loaded_history
             _LOGGER.info("%s: Loaded %d pour records", DOMAIN, len(state["history"]))
+        # 🔄 Recompute today's daily stats & last pour per keg from history
+        def _rebuild_daily_from_history() -> None:
+            """
+            Build per-keg:
+              - daily_consumed (oz for 'today')
+              - last_pour (oz)
+              - last_pour_time (string timestamp)
+            based on stored history.
+            """
+            from datetime import datetime, timezone
+
+            today = datetime.now(timezone.utc).date()
+            per_keg_daily: Dict[str, float] = {}
+            per_keg_last: Dict[str, Dict[str, Any]] = {}
+
+            for row in state.get("history", []):
+                keg_id = row.get("keg")
+                pour_oz = row.get("pour_oz")
+                ts_str = row.get("timestamp")
+
+                if not keg_id or pour_oz is None or not ts_str:
+                    continue
+
+                # history timestamps are stored as "YYYY-MM-DD HH:MM:SS ZZZ"
+                # we only need the date part here
+                try:
+                    date_part = ts_str[:10]  # "YYYY-MM-DD"
+                    d = datetime.strptime(date_part, "%Y-%m-%d").date()
+                except Exception:
+                    continue
+
+                if d != today:
+                    continue
+
+                keg_id = str(keg_id)
+                per_keg_daily[keg_id] = per_keg_daily.get(keg_id, 0.0) + float(pour_oz)
+                per_keg_last[keg_id] = {
+                    "pour_oz": float(pour_oz),
+                    "timestamp": ts_str,
+                }
+
+            initial: Dict[str, Dict[str, Any]] = {}
+            for keg_id, total in per_keg_daily.items():
+                last = per_keg_last.get(keg_id, {})
+                initial[keg_id] = {
+                    "daily_consumed": round(total, 1),
+                    "last_pour": float(last.get("pour_oz", 0.0)),
+                    "last_pour_time": last.get("timestamp"),
+                }
+
+            state["initial_daily_stats"] = initial
+
+        _rebuild_daily_from_history()
 
         # ---- load prefs (display_units + keg_config + tap_text + tap_numbers + smoothing)
         loaded_prefs = await prefs_store.async_load()
@@ -316,14 +369,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 return state.setdefault("devices", [])
 
         # ---------- publisher
-
         async def _publish_keg(norm: dict) -> None:
             """Normalize and push one keg's data into integration state."""
             keg_id = norm["keg_id"]
             weight_raw = norm["weight"]
             temp = norm["temperature"]
-
-            # ---------- INITIALIZE PER-KEG RUNTIME STATE ----------
+            
+        # ---------- INITIALIZE PER-KEG RUNTIME STATE ----------
             info = state["kegs"].get(keg_id)
             if not info:
                 initial_fw = (
@@ -332,11 +384,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     or state["computed_full_from_sg"]
                     or state["default_full"]
                 )
+
+                # Pull any restored daily stats for this keg (from history)
+                initial_stats = state.get("initial_daily_stats", {}).get(keg_id, {})
+
                 info = state["kegs"][keg_id] = {
                     "last_weight_raw": weight_raw,
                     "last_weight": weight_raw,
-                    "daily_consumed": 0.0,
-                    "last_pour": 0.0,
+                    "daily_consumed": float(initial_stats.get("daily_consumed", 0.0)),
+                    "last_pour": float(initial_stats.get("last_pour", 0.0)),
+                    # We'll keep last_pour_time as a datetime going forward;
+                    # history stores string, so just keep None on startup.
                     "last_pour_time": None,
                     "full_weight": float(initial_fw),
                     "recent_weights": [],
