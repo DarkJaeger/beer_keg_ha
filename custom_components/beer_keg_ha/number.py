@@ -261,16 +261,26 @@ class BeerKegGlobalNumberEntity(NumberEntity):
             return self._default
 
     async def async_set_native_value(self, value: float) -> None:
+        """Update the value in integration state and persist it."""
         domain_state = self.hass.data[DOMAIN][self.entry.entry_id]
-        domain_state[self._state_key] = float(value)
+        data: Dict[str, Dict[str, Any]] = domain_state.setdefault("data", {})
+        keg = data.setdefault(self.keg_id, {})
 
-        # Persist (along with all other prefs) so smoothing survives restart
+        val = float(value)
+        keg[self._key] = val
+
+        # Also mirror into keg_config so it survives restart
+        keg_cfg_all: Dict[str, Dict[str, Any]] = domain_state.setdefault("keg_config", {})
+        cfg: Dict[str, Any] = keg_cfg_all.setdefault(self.keg_id, {})
+        cfg[self._key] = val
+
+        # Persist everything via prefs_store (same style as text.py / set_display_units)
         prefs_store = domain_state.get("prefs_store")
         if prefs_store is not None:
             await prefs_store.async_save(
                 {
                     "display_units": domain_state.get("display_units", {}),
-                    "keg_config": domain_state.get("keg_config", {}),
+                    "keg_config": keg_cfg_all,
                     "tap_text": domain_state.get("tap_text", {}),
                     "tap_numbers": domain_state.get("tap_numbers", {}),
                     "noise_deadband_kg": domain_state.get("noise_deadband_kg"),
@@ -278,12 +288,13 @@ class BeerKegGlobalNumberEntity(NumberEntity):
                 }
             )
 
-        # Nudge all kegs so sensors recalc with new smoothing
-        for keg_id in list(domain_state.get("data", {}).keys()):
-            self.hass.bus.async_fire(
-                PLATFORM_EVENT,
-                {"keg_id": keg_id},
-            )
+        # Let any listening sensors/cards update
+        self.hass.bus.async_fire(
+            PLATFORM_EVENT,
+            {"keg_id": self.keg_id},
+        )
+        self.async_write_ha_state()
+
 
         self.async_write_ha_state()
 

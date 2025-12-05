@@ -467,7 +467,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             # ---------- APPLY MANUAL OVERRIDES FROM NUMBER ENTITIES ----------
             existing = state["data"].get(keg_id, {})
 
-            # Keep defaults only if no data yet
+            # Pull persisted overrides from keg_config if present
+            keg_cfg_all: Dict[str, Dict[str, Any]] = state.get("keg_config", {}) or {}
+            keg_cfg: Dict[str, Any] = keg_cfg_all.get(keg_id, {}) or {}
+
+            # Seed full_weight / calibrations from keg_config if we don't already
+            if "full_weight" in keg_cfg and "full_weight" not in existing:
+                try:
+                    existing["full_weight"] = float(keg_cfg["full_weight"])
+                except (TypeError, ValueError):
+                    pass
+
+            if "weight_calibrate" in keg_cfg and "weight_calibrate" not in existing:
+                try:
+                    existing["weight_calibrate"] = float(keg_cfg["weight_calibrate"])
+                except (TypeError, ValueError):
+                    pass
+
+            if "temperature_calibrate" in keg_cfg and "temperature_calibrate" not in existing:
+                try:
+                    existing["temperature_calibrate"] = float(keg_cfg["temperature_calibrate"])
+                except (TypeError, ValueError):
+                    pass
+
+            # Keep hard defaults only if still nothing set
             if "full_weight" not in existing:
                 existing["full_weight"] = 19.0
             if "weight_calibrate" not in existing:
