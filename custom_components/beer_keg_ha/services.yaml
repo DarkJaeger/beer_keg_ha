@@ -8,51 +8,15 @@ refresh_kegs:
 
 republish_all:
   name: Republish All
-  description: Re-fire update events for all known kegs (useful to refresh dashboards)
+  description: Re-fire update events for all known kegs
 
 refresh_devices:
   name: Refresh Device List
-  description: Query /api/kegs/devices to update the device selector (select.beer_keg_devices)
+  description: Query /api/kegs/devices to update the device selector
 
 calibrate_keg:
   name: Calibrate Keg
   description: Send calibration payload to /api/kegs/calibrate
-  fields:
-    id:
-      name: Keg ID
-      description: Target keg id (e.g., from select.beer_keg_devices)
-      required: true
-      example: "00000000000000000000000000000001"
-      selector:
-        text:
-    name:
-      name: Name
-      required: true
-      selector:
-        text:
-    full_weight:
-      name: Full weight (kg)
-      required: true
-      selector:
-        number:
-          min: 0
-          step: 0.01
-    weight_calibrate:
-      name: Weight calibrate (kg)
-      required: true
-      selector:
-        number:
-          min: -10
-          max: 10
-          step: 0.01
-    temperature_calibrate:
-      name: Temperature calibrate (°C)
-      required: true
-      selector:
-        number:
-          min: -10
-          max: 10
-          step: 0.1
 
 set_display_units:
   name: Set Display Units
@@ -60,13 +24,195 @@ set_display_units:
   fields:
     weight_unit:
       name: Weight unit
-      required: true
+      required: false
       selector:
         select:
           options: [kg, lb]
     temp_unit:
       name: Temperature unit
-      required: true
+      required: false
       selector:
         select:
           options: ["°C", "°F"]
+
+# ------------------------------------------------------------
+# Keg Command API (new server; graceful 404 on old server)
+# If you omit `id`, the integration uses select.keg_device
+
+keg_tare:
+  name: Tare Scale
+  description: POST /api/kegs/:id/tare
+  fields:
+    id:
+      name: Keg ID
+      required: false
+      selector:
+        text:
+
+keg_set_empty_keg_weight:
+  name: Set Empty Keg Weight
+  description: POST /api/kegs/:id/empty-keg
+  fields:
+    id:
+      name: Keg ID
+      required: false
+      selector:
+        text:
+    value:
+      name: Empty keg weight (kg)
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 50
+          step: 0.01
+
+keg_set_max_keg_volume:
+  name: Set Max Keg Volume
+  description: POST /api/kegs/:id/max-keg-volume
+  fields:
+    id:
+      name: Keg ID
+      required: false
+      selector:
+        text:
+    value:
+      name: Max volume (liters)
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 0.01
+
+keg_set_temperature_offset:
+  name: Set Temperature Offset
+  description: POST /api/kegs/:id/temperature-offset
+  fields:
+    id:
+      name: Keg ID
+      required: false
+      selector:
+        text:
+    value:
+      name: Temperature offset (°C)
+      required: true
+      selector:
+        number:
+          min: -20
+          max: 20
+          step: 0.1
+
+keg_calibrate_known_weight:
+  name: Calibrate With Known Weight
+  description: POST /api/kegs/:id/calibrate-known-weight
+  fields:
+    id:
+      name: Keg ID
+      required: false
+      selector:
+        text:
+    value:
+      name: Known weight (kg)
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 0.01
+
+keg_set_beer_style:
+  name: Set Beer Style
+  description: POST /api/kegs/:id/beer-style
+  fields:
+    id:
+      name: Keg ID
+      required: false
+      selector:
+        text:
+    value:
+      name: Beer style
+      required: true
+      selector:
+        text:
+
+keg_set_date:
+  name: Set Keg Date
+  description: POST /api/kegs/:id/date
+  fields:
+    id:
+      name: Keg ID
+      required: false
+      selector:
+        text:
+    value:
+      name: Date string (YYYY-MM-DD recommended)
+      required: true
+      selector:
+        text:
+
+keg_set_unit_system:
+  name: Set Unit System
+  description: POST /api/kegs/:id/unit
+  fields:
+    id:
+      name: Keg ID
+      required: false
+      selector:
+        text:
+    value:
+      name: Unit system
+      required: true
+      selector:
+        select:
+          options: [metric, us]
+
+keg_set_measure_unit:
+  name: Set Measure Mode
+  description: POST /api/kegs/:id/measure-unit
+  fields:
+    id:
+      name: Keg ID
+      required: false
+      selector:
+        text:
+    value:
+      name: Measure mode
+      required: true
+      selector:
+        select:
+          options: [weight, volume]
+
+keg_set_mode:
+  name: Set Keg Mode
+  description: POST /api/kegs/:id/keg-mode
+  fields:
+    id:
+      name: Keg ID
+      required: false
+      selector:
+        text:
+    value:
+      name: Keg mode
+      required: true
+      selector:
+        select:
+          options: [beer, co2]
+
+keg_set_sensitivity:
+  name: Set Sensitivity
+  description: POST /api/kegs/:id/sensitivity
+  fields:
+    id:
+      name: Keg ID
+      required: false
+      selector:
+        text:
+    value:
+      name: Sensitivity
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 10
+          step: 1

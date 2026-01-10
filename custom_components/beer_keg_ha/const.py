@@ -7,7 +7,7 @@ CONF_DEFAULT_FULL_WEIGHT = "default_full_weight"
 CONF_POUR_THRESHOLD = "pour_threshold"
 CONF_PER_KEG_FULL = "per_keg_full"
 
-# Density-aware fill%
+# Density-aware fill% / conversions
 CONF_FULL_VOLUME_L = "full_volume_liters"
 CONF_BEER_SG = "beer_specific_gravity"
 
@@ -22,4 +22,8 @@ WATER_DENSITY_KG_PER_L = 0.998
 
 # History
 MAX_LOG_ENTRIES = 500
+
+# Runtime flags / diagnostics
+ATTR_PLAATO_API_VERSION = "plaato_api_version"  # "v1" | "v2"
+ATTR_PLAATO_API_V2 = "plaato_api_v2"            # bool
 

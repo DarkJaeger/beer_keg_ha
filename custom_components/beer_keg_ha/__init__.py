@@ -9,15 +9,14 @@ from typing import Any, Dict, List
 from urllib.parse import urlparse, urlunparse
 
 import aiohttp
+import voluptuous as vol
 from homeassistant.components.persistent_notification import async_create as pn_create
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.event import (
-    async_track_time_interval,
-    async_track_time_change,
-)
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
 
 from .const import (
@@ -31,12 +30,26 @@ from .const import (
     DEFAULT_EMPTY_WEIGHT,
     DEFAULT_FULL_WEIGHT,
     DEFAULT_POUR_THRESHOLD,
+    ATTR_PLAATO_API_VERSION,
+    ATTR_PLAATO_API_V2,
 )
+
+# Helper entities for unit selection
+WEIGHT_UNIT_ENTITIES = [
+    "select.keg_weight_unit",
+    "input_select.keg_weight_unit",
+]
+
+TEMP_UNIT_ENTITIES = [
+    "select.keg_temperature_unit",
+    "select.keg_temp_unit",
+    "input_select.keg_temp_unit",
+]
 
 _LOGGER = logging.getLogger(__name__)
 
 # Platforms we load
-PLATFORMS = ["sensor", "select", "number", "text", "date"]
+PLATFORMS = ["sensor", "select", "number"]
 
 # hassfest requirement
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -61,7 +74,7 @@ try:
     )
 
     DENSITY_AWARE = True
-except Exception:  # pragma: no cover - optional import
+except Exception:
     DENSITY_AWARE = False
     CONF_FULL_VOLUME_L = "full_volume_liters"
     CONF_BEER_SG = "beer_specific_gravity"
@@ -70,21 +83,60 @@ except Exception:  # pragma: no cover - optional import
     WATER_DENSITY_KG_PER_L = 0.998
 
 
-def _coerce_float(val: Any, default: float = 0.0) -> float:
+def _coerce_float(val, default: float = 0.0) -> float:
     try:
         return float(val)
     except Exception:
         return default
 
 
-def _normalize_keg_dict(keg: dict) -> dict:
-    """Normalize keg dict from WS/REST payloads into a common structure."""
+def _normalize_keg_dict(keg: dict, state: dict) -> dict:
+    """Normalize keg dict from WS/REST payloads.
+
+    Backwards compatible:
+      - API v1 (legacy): weight, temperature, full_weight, temperature_calibrate
+      - API v2 (new): amount_left, percent_of_beer_left, keg_temperature, empty_keg_weight, max_keg_volume, temperature_offset
+    """
     keg_id = str(keg.get("id", "unknown")).lower().replace(" ", "_")
-    weight = _coerce_float(keg.get("weight"))
-    temp = keg.get("temperature")
-    temp = _coerce_float(temp) if temp is not None else None
-    full_w = _coerce_float(keg.get("full_weight"), default=0.0)
     name = keg.get("name") or keg_id
+
+    is_v2 = ("amount_left" in keg) or ("percent_of_beer_left" in keg) or ("keg_temperature" in keg)
+    api_version = "v2" if is_v2 else "v1"
+
+    # Temperature
+    temp_val = keg.get("keg_temperature") if is_v2 else keg.get("temperature")
+    temp = _coerce_float(temp_val) if temp_val is not None else None
+
+    # Empty keg weight from device (v2)
+    device_empty_kg = _coerce_float(keg.get("empty_keg_weight"), default=0.0) if is_v2 else None
+
+    liters_left = _coerce_float(keg.get("amount_left"), default=0.0) if is_v2 else None
+    percent_left = _coerce_float(keg.get("percent_of_beer_left"), default=0.0) if is_v2 else None
+
+    # Weight:
+    # - v1: use device weight
+    # - v2: compute from liters_left + SG + water density, and add device empty weight if present
+    if is_v2:
+        beer_sg = float(state.get("beer_sg", DEFAULT_BEER_SG))
+        liquid_kg = float(liters_left) * beer_sg * WATER_DENSITY_KG_PER_L
+        weight = float(device_empty_kg or 0.0) + liquid_kg
+    else:
+        weight = _coerce_float(keg.get("weight"))
+
+    # Full weight:
+    # - v1: use device full_weight if present
+    # - v2: compute from max_keg_volume + SG + water density (+ empty)
+    full_w = _coerce_float(keg.get("full_weight"), default=0.0)
+    if is_v2:
+        max_vol_l = _coerce_float(keg.get("max_keg_volume"), default=0.0)
+        if max_vol_l > 0:
+            beer_sg = float(state.get("beer_sg", DEFAULT_BEER_SG))
+            full_liquid_kg = max_vol_l * beer_sg * WATER_DENSITY_KG_PER_L
+            full_w = float(device_empty_kg or 0.0) + full_liquid_kg
+
+    # Calibration offset key changed name in v2
+    temp_cal = keg.get("temperature_offset") if is_v2 else keg.get("temperature_calibrate")
+
     return {
         "keg_id": keg_id,
         "name": name,
@@ -92,7 +144,12 @@ def _normalize_keg_dict(keg: dict) -> dict:
         "temperature": temp,
         "full_weight": full_w if full_w > 0 else None,
         "weight_calibrate": _coerce_float(keg.get("weight_calibrate")),
-        "temperature_calibrate": _coerce_float(keg.get("temperature_calibrate")),
+        "temperature_calibrate": _coerce_float(temp_cal),
+        # v2 extras
+        "liters_left": liters_left,
+        "percent_left": percent_left,
+        "device_empty_kg": device_empty_kg,
+        ATTR_PLAATO_API_VERSION: api_version,
     }
 
 
@@ -109,50 +166,17 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     try:
-        ws_url: str | None = entry.data.get(CONF_WS_URL)
+        ws_url: str = entry.data.get(CONF_WS_URL)
         if not ws_url:
             _LOGGER.error("%s: Missing ws_url", DOMAIN)
             return False
-
-        # 🔧 Normalize the WS URL:
-        # - Add ws:// if scheme is missing
-        # - If no path is present, default to /ws
-        raw_ws = ws_url.strip()
-        from urllib.parse import urlparse, urlunparse
-
-        u = urlparse(raw_ws)
-
-        # If user entered just "10.10.12.23:8085" or similar
-        if not u.scheme and u.path and not u.netloc:
-            raw_ws = f"ws://{raw_ws}"
-            u = urlparse(raw_ws)
-
-        scheme = u.scheme or "ws"
-        netloc = u.netloc or u.path
-        path = u.path or ""
-
-        if not path or path == "/":
-            # Default to /ws when no explicit path is given
-            path = "/ws"
-
-        ws_url_normalized = urlunparse((scheme, netloc, path, "", "", ""))
-
-        if ws_url_normalized != ws_url:
-            _LOGGER.info(
-                "%s: Normalized WS URL from %s to %s",
-                DOMAIN,
-                ws_url,
-                ws_url_normalized,
-            )
-
-        ws_url = ws_url_normalized
 
         opts = entry.options or {}
         empty_weight = float(opts.get(CONF_EMPTY_WEIGHT, DEFAULT_EMPTY_WEIGHT))
         default_full = float(opts.get(CONF_DEFAULT_FULL_WEIGHT, DEFAULT_FULL_WEIGHT))
         pour_threshold = float(opts.get(CONF_POUR_THRESHOLD, DEFAULT_POUR_THRESHOLD))
 
-        # Optional density-aware computed full weight (global default)
+        # Optional density-aware computed full weight
         if DENSITY_AWARE:
             full_volume_l = float(opts.get(CONF_FULL_VOLUME_L, DEFAULT_FULL_VOLUME_L))
             beer_sg = float(opts.get(CONF_BEER_SG, DEFAULT_BEER_SG))
@@ -178,7 +202,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         history_store: Store = Store(hass, 1, f"{DOMAIN}_history")
         prefs_store: Store = Store(hass, 1, f"{DOMAIN}_prefs")
 
-        # Main runtime state for this config entry
         state: Dict[str, Any] = {
             "ws_url": ws_url,
             "empty_weight": empty_weight,
@@ -192,127 +215,37 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "data": {},          # values exposed to entities
             "history": [],
             "devices": [],
-            "display_units": {   # may be overridden by prefs below
+            "display_units": {   # default; may be overridden by prefs below
                 "weight": "kg",
                 "temp": "°C",
-                "pour": "oz",    # last_pour / daily_consumption base unit
             },
-            "tap_text": {},      # tap config (if you use it)
-            "tap_numbers": {},
-            # Global smoothing config (overridable via Number entities)
-            "noise_deadband_kg": float(opts.get("noise_deadband_kg", 0.0)),
-            "smoothing_alpha": float(opts.get("smoothing_alpha", 1.0)),
-            # Optional per-keg config that should survive restart
-            "keg_config": {},
             "history_store": history_store,
             "prefs_store": prefs_store,
-            "background_tasks": [],   # track long-running tasks (WS loop, pinger, etc.)
+            # Capability flags (auto-detected)
+            ATTR_PLAATO_API_V2: False,
+            ATTR_PLAATO_API_VERSION: "v1",
             LAST_UPDATE_KEY: None,
         }
 
         hass.data[DOMAIN][entry.entry_id] = state
 
         # ---- load history from storage
-        loaded_history = await history_store.async_load()
-        if isinstance(loaded_history, list):
-            state["history"] = loaded_history
+        loaded = await history_store.async_load()
+        if isinstance(loaded, list):
+            state["history"] = loaded
             _LOGGER.info("%s: Loaded %d pour records", DOMAIN, len(state["history"]))
-        # 🔄 Recompute today's daily stats & last pour per keg from history
-        def _rebuild_daily_from_history() -> None:
-            """
-            Build per-keg:
-              - daily_consumed (oz for 'today')
-              - last_pour (oz)
-              - last_pour_time (string timestamp)
-            based on stored history.
-            """
-            from datetime import datetime, timezone
 
-            today = datetime.now(timezone.utc).date()
-            per_keg_daily: Dict[str, float] = {}
-            per_keg_last: Dict[str, Dict[str, Any]] = {}
-
-            for row in state.get("history", []):
-                keg_id = row.get("keg")
-                pour_oz = row.get("pour_oz")
-                ts_str = row.get("timestamp")
-
-                if not keg_id or pour_oz is None or not ts_str:
-                    continue
-
-                # history timestamps are stored as "YYYY-MM-DD HH:MM:SS ZZZ"
-                # we only need the date part here
-                try:
-                    date_part = ts_str[:10]  # "YYYY-MM-DD"
-                    d = datetime.strptime(date_part, "%Y-%m-%d").date()
-                except Exception:
-                    continue
-
-                if d != today:
-                    continue
-
-                keg_id = str(keg_id)
-                per_keg_daily[keg_id] = per_keg_daily.get(keg_id, 0.0) + float(pour_oz)
-                per_keg_last[keg_id] = {
-                    "pour_oz": float(pour_oz),
-                    "timestamp": ts_str,
-                }
-
-            initial: Dict[str, Dict[str, Any]] = {}
-            for keg_id, total in per_keg_daily.items():
-                last = per_keg_last.get(keg_id, {})
-                initial[keg_id] = {
-                    "daily_consumed": round(total, 1),
-                    "last_pour": float(last.get("pour_oz", 0.0)),
-                    "last_pour_time": last.get("timestamp"),
-                }
-
-            state["initial_daily_stats"] = initial
-
-        _rebuild_daily_from_history()
-
-        # ---- load prefs (display_units + keg_config + tap_text + tap_numbers + smoothing)
-        loaded_prefs = await prefs_store.async_load()
-        if isinstance(loaded_prefs, dict):
-            du = loaded_prefs.get("display_units")
+        # ---- load display_units from prefs (if any)
+        prefs = await prefs_store.async_load()
+        if isinstance(prefs, dict):
+            du = prefs.get("display_units")
             if isinstance(du, dict):
                 w = du.get("weight")
                 t = du.get("temp")
-                p = du.get("pour")
                 if w in ("kg", "lb"):
                     state["display_units"]["weight"] = w
                 if t in ("°C", "°F"):
                     state["display_units"]["temp"] = t
-                if p in ("oz", "ml"):
-                    state["display_units"]["pour"] = p
-
-            keg_cfg = loaded_prefs.get("keg_config")
-            if isinstance(keg_cfg, dict):
-                norm_cfg: Dict[str, Dict[str, Any]] = {}
-                for k, v in keg_cfg.items():
-                    keg_id = str(k).lower().replace(" ", "_")
-                    if isinstance(v, dict):
-                        norm_cfg[keg_id] = v
-                state["keg_config"] = norm_cfg
-
-            # restore tap text / numbers
-            tap_text = loaded_prefs.get("tap_text")
-            if isinstance(tap_text, dict):
-                state["tap_text"] = tap_text
-
-            tap_numbers = loaded_prefs.get("tap_numbers")
-            if isinstance(tap_numbers, dict):
-                state["tap_numbers"] = tap_numbers
-
-            # restore per-entry smoothing settings
-            ndb = loaded_prefs.get("noise_deadband_kg")
-            if isinstance(ndb, (int, float)):
-                state["noise_deadband_kg"] = float(ndb)
-
-            sa = loaded_prefs.get("smoothing_alpha")
-            if isinstance(sa, (int, float)):
-                state["smoothing_alpha"] = float(sa)
-        # ---- end load prefs
 
         # ---------- REST helpers
 
@@ -369,78 +302,48 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 return state.setdefault("devices", [])
 
         # ---------- publisher
+
         async def _publish_keg(norm: dict) -> None:
-            """Normalize and push one keg's data into integration state."""
             keg_id = norm["keg_id"]
-            weight_raw = norm["weight"]
+            weight = norm["weight"]
             temp = norm["temperature"]
-            
-        # ---------- INITIALIZE PER-KEG RUNTIME STATE ----------
+
+            # Capability flags
+            if norm.get(ATTR_PLAATO_API_VERSION) == "v2":
+                state[ATTR_PLAATO_API_V2] = True
+                state[ATTR_PLAATO_API_VERSION] = "v2"
+
             info = state["kegs"].get(keg_id)
             if not info:
+                # Full weight priority:
+                # 1) device-reported
+                # 2) per-keg override
+                # 3) computed from SG+volume
+                # 4) default
                 initial_fw = (
                     norm["full_weight"]
                     or state["per_keg_full"].get(keg_id)
                     or state["computed_full_from_sg"]
                     or state["default_full"]
                 )
-
-                # Pull any restored daily stats for this keg (from history)
-                initial_stats = state.get("initial_daily_stats", {}).get(keg_id, {})
-
                 info = state["kegs"][keg_id] = {
-                    "last_weight_raw": weight_raw,
-                    "last_weight": weight_raw,
-                    "daily_consumed": float(initial_stats.get("daily_consumed", 0.0)),
-                    "last_pour": float(initial_stats.get("last_pour", 0.0)),
-                    # We'll keep last_pour_time as a datetime going forward;
-                    # history stores string, so just keep None on startup.
+                    "last_weight": weight,
+                    "daily_consumed": 0.0,   # oz
+                    "last_pour": 0.0,        # oz
                     "last_pour_time": None,
-                    "full_weight": float(initial_fw),
-                    "recent_weights": [],
+                    "full_weight": float(initial_fw) if initial_fw else float(state["default_full"]),
                 }
 
-            # ---------- POUR DETECTION ----------
-            prev_weight_raw = info.get("last_weight_raw", weight_raw)
-            raw_delta = prev_weight_raw - weight_raw
-            is_pour = raw_delta > state.get("pour_threshold", DEFAULT_POUR_THRESHOLD)
-            info["last_weight_raw"] = weight_raw
+            # If device later reports a full_weight, adopt it
+            if norm["full_weight"] and norm["full_weight"] > 0 and norm["full_weight"] != info["full_weight"]:
+                info["full_weight"] = float(norm["full_weight"])
 
-            # ---------- CHECK PER-KEG BYPASS FLAG ----------
-            keg_cfg = state.get("keg_config", {}).get(keg_id, {}) or {}
-            bypass_smoothing = bool(keg_cfg.get("disable_smoothing", False))
+            prev_weight = info["last_weight"]
+            info["last_weight"] = weight
 
-            # ---------- SMOOTHING ----------
-            display_weight = weight_raw
-            if not is_pour and not bypass_smoothing:
-                recent = info.setdefault("recent_weights", [])
-                recent.append(weight_raw)
-                if len(recent) > 5:
-                    recent.pop(0)
-
-                median_kg = sorted(recent)[len(recent) // 2]
-
-                alpha = float(state.get("smoothing_alpha", 1.0))
-                if not (0 < alpha <= 1):
-                    alpha = 1.0
-                previous_filtered = info.get("filtered_weight", median_kg)
-                filtered = (alpha * median_kg) + ((1 - alpha) * previous_filtered)
-
-                deadband = float(state.get("noise_deadband_kg", 0.0))
-                if abs(filtered - previous_filtered) < deadband:
-                    filtered = previous_filtered
-
-                display_weight = filtered
-                info["filtered_weight"] = filtered
-            else:
-                # During pours OR when bypass_smoothing is True, use raw weight
-                info["filtered_weight"] = weight_raw
-
-            info["last_weight"] = display_weight
-
-            # ---------- POUR STATS ----------
-            if is_pour:
-                delta_kg = round(raw_delta, 2)
+            # Pour detection (kg -> store oz)
+            if prev_weight - weight > state["pour_threshold"]:
+                delta_kg = round(prev_weight - weight, 2)
                 delta_oz = round(delta_kg * KG_TO_OZ, 1)
                 info["last_pour"] = delta_oz
                 info["last_pour_time"] = datetime.now(timezone.utc)
@@ -448,101 +351,62 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
                 state["history"].append(
                     {
-                        "timestamp": datetime.now(timezone.utc).strftime(
-                            "%Y-%m-%d %H:%M:%S %Z"
-                        ),
+                        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z"),
                         "keg": keg_id,
                         "pour_oz": delta_oz,
-                        "weight_before_kg": round(prev_weight_raw, 2),
-                        "weight_after_kg": round(weight_raw, 2),
+                        "weight_before_kg": round(prev_weight, 2),
+                        "weight_after_kg": round(weight, 2),
                         "temperature_c": temp,
                     }
                 )
                 if len(state["history"]) > MAX_LOG_ENTRIES:
                     state["history"].pop(0)
-                await state["history_store"].async_save(
-                    state["history"][-MAX_LOG_ENTRIES:]
-                )
+                await state["history_store"].async_save(state["history"][-MAX_LOG_ENTRIES:])
 
-            # ---------- APPLY MANUAL OVERRIDES FROM NUMBER ENTITIES ----------
-            existing = state["data"].get(keg_id, {})
-
-            # Pull persisted overrides from keg_config if present
-            keg_cfg_all: Dict[str, Dict[str, Any]] = state.get("keg_config", {}) or {}
-            keg_cfg: Dict[str, Any] = keg_cfg_all.get(keg_id, {}) or {}
-
-            # Seed full_weight / calibrations from keg_config if we don't already
-            if "full_weight" in keg_cfg and "full_weight" not in existing:
-                try:
-                    existing["full_weight"] = float(keg_cfg["full_weight"])
-                except (TypeError, ValueError):
-                    pass
-
-            if "weight_calibrate" in keg_cfg and "weight_calibrate" not in existing:
-                try:
-                    existing["weight_calibrate"] = float(keg_cfg["weight_calibrate"])
-                except (TypeError, ValueError):
-                    pass
-
-            if "temperature_calibrate" in keg_cfg and "temperature_calibrate" not in existing:
-                try:
-                    existing["temperature_calibrate"] = float(keg_cfg["temperature_calibrate"])
-                except (TypeError, ValueError):
-                    pass
-
-            # Keep hard defaults only if still nothing set
-            if "full_weight" not in existing:
-                existing["full_weight"] = 19.0
-            if "weight_calibrate" not in existing:
-                existing["weight_calibrate"] = 0.15
-            if "temperature_calibrate" not in existing:
-                existing["temperature_calibrate"] = 0.0
-
-            # Use manual overrides FIRST
-            override_fw = existing.get("full_weight")
-            override_wc = existing.get("weight_calibrate")
-            override_tc = existing.get("temperature_calibrate")
-
-            # ---------- FILL % ----------
+            # Fill % (use device empty keg weight if present, else config empty_weight)
             fw = (
-                override_fw
-                or info.get("full_weight")
+                info.get("full_weight")
                 or state["per_keg_full"].get(keg_id)
                 or state["computed_full_from_sg"]
                 or state["default_full"]
             )
 
-            ew = state["empty_weight"]
-            w_val = max(0.0, display_weight)
+            device_ew = norm.get("device_empty_kg")
+            ew = float(device_ew) if isinstance(device_ew, (int, float)) and device_ew > 0 else state["empty_weight"]
 
+            w = max(0.0, weight)
             if fw and fw > ew:
-                fill_pct = ((w_val - ew) / (fw - ew)) * 100.0
+                fill_pct = ((w - ew) / (fw - ew)) * 100.0
             else:
                 fill_pct = 0.0
-            fill_pct = max(0, min(100, fill_pct))
+            fill_pct = max(0.0, min(100.0, fill_pct))
 
-            # ---------- WRITE STATE BACK ----------
             state["data"][keg_id] = {
-                **existing,
                 "id": keg_id,
                 "name": norm["name"],
-                "weight": round(display_weight, 2),
+                "weight": round(weight, 2),
                 "temperature": round(temp, 1) if temp is not None else None,
-                "full_weight": round(float(fw), 2),
-                "weight_calibrate": override_wc,
-                "temperature_calibrate": override_tc,
+                "full_weight": round(float(fw), 2) if fw else None,
+                "weight_calibrate": norm.get("weight_calibrate"),
+                "temperature_calibrate": norm.get("temperature_calibrate"),
                 "daily_consumed": round(info["daily_consumed"], 1),
                 "last_pour": round(info["last_pour"], 1),
                 "fill_percent": round(fill_pct, 1),
+                # v2 fields
+                "liters_left": norm.get("liters_left"),
+                "percent_left": norm.get("percent_left"),
+                # diagnostics
+                ATTR_PLAATO_API_VERSION: state.get(ATTR_PLAATO_API_VERSION, "v1"),
+                ATTR_PLAATO_API_V2: bool(state.get(ATTR_PLAATO_API_V2, False)),
             }
-
             state[LAST_UPDATE_KEY] = datetime.now(timezone.utc)
 
+            # Make sure devices list gets this ID as a fallback
+            if "devices" not in state:
+                state["devices"] = []
             if keg_id not in state["devices"]:
                 state["devices"].append(keg_id)
-                hass.bus.async_fire(
-                    DEVICES_UPDATE_EVENT, {"ids": list(state["devices"])}
-                )
+                hass.bus.async_fire(DEVICES_UPDATE_EVENT, {"ids": list(state["devices"])})
 
             hass.bus.async_fire(f"{DOMAIN}_update", {"keg_id": keg_id})
 
@@ -556,65 +420,51 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         async with http_sess.ws_connect(ws_url) as ws:
                             _LOGGER.info("%s: Connected to WS", DOMAIN)
 
-                            async def _pinger() -> None:
-                                try:
-                                    while True:
-                                        await ws.ping()
-                                        await asyncio.sleep(WS_PING_SEC)
-                                except asyncio.CancelledError:
-                                    _LOGGER.debug("%s: WS pinger cancelled", DOMAIN)
-                                    return
-                                except Exception:
-                                    return
-
-                            # Track the pinger task
-                            ping_task = hass.async_create_task(_pinger())
-                            state["background_tasks"].append(ping_task)
-
-                            try:
-                                async for msg in ws:
-                                    if msg.type != aiohttp.WSMsgType.TEXT:
-                                        continue
+                            async def _pinger():
+                                while True:
                                     try:
-                                        data = json.loads(msg.data)
-                                    except json.JSONDecodeError:
-                                        continue
+                                        await ws.ping()
+                                    except Exception:
+                                        break
+                                    await asyncio.sleep(WS_PING_SEC)
 
-                                    if isinstance(data, list):
-                                        source = data
-                                    else:
-                                        kegs = data.get("kegs")
-                                        source = kegs if isinstance(kegs, list) else None
-                                    if not source:
-                                        continue
+                            hass.async_create_task(_pinger())
 
-                                    for raw in source:
-                                        norm = _normalize_keg_dict(raw)
-                                        await _publish_keg(norm)
-                            except asyncio.CancelledError:
-                                _LOGGER.info("%s: connect_websocket cancelled", DOMAIN)
-                                if not ping_task.done():
-                                    ping_task.cancel()
-                                return
-                    except asyncio.CancelledError:
-                        _LOGGER.info("%s: WS loop task cancelled", DOMAIN)
-                        return
+                            async for msg in ws:
+                                if msg.type != aiohttp.WSMsgType.TEXT:
+                                    continue
+                                try:
+                                    data = json.loads(msg.data)
+                                except json.JSONDecodeError:
+                                    continue
+
+                                if isinstance(data, list):
+                                    source = data
+                                else:
+                                    kegs = data.get("kegs")
+                                    source = kegs if isinstance(kegs, list) else None
+                                if not source:
+                                    continue
+
+                                for raw in source:
+                                    norm = _normalize_keg_dict(raw, state)
+                                    await _publish_keg(norm)
                     except Exception as e:
                         _LOGGER.error("%s: WS error: %s", DOMAIN, e)
                         await asyncio.sleep(10)
 
         # ---------- REST poll & watchdog
 
-        async def rest_poll(_now: datetime | None = None) -> None:
+        async def rest_poll(_now=None) -> None:
             try:
                 new_kegs = await fetch_kegs()
                 for raw in new_kegs:
-                    norm = _normalize_keg_dict(raw)
+                    norm = _normalize_keg_dict(raw, state)
                     await _publish_keg(norm)
             except Exception as e:
                 _LOGGER.debug("%s: REST poll error: %s", DOMAIN, e)
 
-        async def watchdog(_now: datetime | None = None) -> None:
+        async def watchdog(_now=None) -> None:
             ts = state.get(LAST_UPDATE_KEY)
             if ts is None:
                 return
@@ -629,7 +479,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     new_kegs = await fetch_kegs()
                     if new_kegs:
                         for raw in new_kegs:
-                            norm = _normalize_keg_dict(raw)
+                            norm = _normalize_keg_dict(raw, state)
                             await _publish_keg(norm)
                     else:
                         for keg_id in list(state.get("data", {}).keys()):
@@ -639,32 +489,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     for keg_id in list(state.get("data", {}).keys()):
                         hass.bus.async_fire(f"{DOMAIN}_update", {"keg_id": keg_id})
 
-        async def _periodic_devices(_now: datetime | None) -> None:
+        async def _periodic_devices(_now) -> None:
             await fetch_devices()
-
-        async def reset_daily_consumption(_now: datetime | None = None) -> None:
-            """Reset daily_consumed for all kegs at local midnight."""
-            try:
-                for keg_id, info in state.get("kegs", {}).items():
-                    info["daily_consumed"] = 0.0
-                    if keg_id in state.get("data", {}):
-                        state["data"][keg_id]["daily_consumed"] = 0.0
-                    hass.bus.async_fire(f"{DOMAIN}_update", {"keg_id": keg_id})
-
-                _LOGGER.info(
-                    "%s: daily_consumed reset to 0 for %d kegs",
-                    DOMAIN,
-                    len(state.get("kegs", {})),
-                )
-            except Exception as e:
-                _LOGGER.error("%s: failed resetting daily_consumed: %s", DOMAIN, e)
 
         # ---------- Services
 
         async def export_history(call: ServiceCall) -> None:
             path = hass.config.path("www/beer_keg_history.json")
 
-            def _write_export() -> None:
+            def _write_export():
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, "w", encoding="utf-8") as f:
                     json.dump(state["history"][-MAX_LOG_ENTRIES:], f, indent=2)
@@ -681,13 +514,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         async def refresh_kegs(call: ServiceCall) -> None:
             new_kegs = await fetch_kegs()
             for raw in new_kegs:
-                norm = _normalize_keg_dict(raw)
+                norm = _normalize_keg_dict(raw, state)
                 await _publish_keg(norm)
-            pn_create(
-                hass,
-                f"Refreshed {len(new_kegs)} kegs",
-                title="Beer Keg Refresh",
-            )
+            pn_create(hass, f"Refreshed {len(new_kegs)} kegs", title="Beer Keg Refresh")
 
         hass.services.async_register(DOMAIN, "refresh_kegs", refresh_kegs)
 
@@ -695,138 +524,49 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             data = state.get("data", {})
             for keg_id in data.keys():
                 hass.bus.async_fire(f"{DOMAIN}_update", {"keg_id": keg_id})
-            pn_create(
-                hass,
-                f"Republished {len(data)} kegs",
-                title="Beer Keg Republish",
-            )
+            pn_create(hass, f"Republished {len(data)} kegs", title="Beer Keg Republish")
 
         hass.services.async_register(DOMAIN, "republish_all", republish_all)
 
         async def refresh_devices(call: ServiceCall) -> None:
             ids = await fetch_devices()
-            pn_create(
-                hass,
-                f"Found {len(ids)} device(s).",
-                title="Beer Keg Devices",
-            )
+            pn_create(hass, f"Found {len(ids)} device(s).", title="Beer Keg Devices")
 
         hass.services.async_register(DOMAIN, "refresh_devices", refresh_devices)
 
         async def calibrate_keg(call: ServiceCall) -> None:
             """
-            Calibrate a keg.
-
-            Supports three ways of getting data:
-
-            1) Direct values in service call
-            2) Entity IDs in service call
-            3) Nothing in data: fall back to select.keg_device + state["data"][keg_id].
+            Read the selected keg + calibration values from HA entities
+            and POST /api/kegs/calibrate.
             """
-
             base = _rest_base_from_ws(state["ws_url"])
             url = f"{base}/api/kegs/calibrate"
 
-            data_state: Dict[str, Dict[str, Any]] = state.get("data", {})
+            dev_state = hass.states.get("select.keg_device")
+            if not dev_state or dev_state.state in ("unknown", "unavailable", ""):
+                pn_create(hass, "No keg selected.", title="Beer Keg Calibration")
+                return
 
-            # ---------- helpers to read HA entities ----------
-            def _get_ent_state(ent_id: str | None) -> str | None:
-                if not ent_id:
-                    return None
-                ent = hass.states.get(ent_id)
-                if not ent or ent.state in ("unknown", "unavailable", ""):
-                    return None
-                return ent.state
+            keg_id = dev_state.state
 
-            def _get_ent_float(ent_id: str | None, default: float) -> float:
-                s = _get_ent_state(ent_id)
-                if s is None:
-                    return default
-                try:
-                    return float(s)
-                except (TypeError, ValueError):
-                    return default
-
-            # ---------- 1) Resolve keg_id ----------
-            keg_id = call.data.get("id")
-
-            if not keg_id:
-                id_entity = call.data.get("id_entity")
-                keg_id = _get_ent_state(id_entity)
-
-            if not keg_id:
-                dev_state = hass.states.get("select.keg_device")
-                if not dev_state or dev_state.state in ("unknown", "unavailable", ""):
-                    pn_create(hass, "No keg selected.", title="Beer Keg Calibration")
-                    _LOGGER.error(
-                        "%s: calibrate_keg – no keg id", DOMAIN
-                    )
-                    return
-                keg_id = dev_state.state
-
-            keg_id = str(keg_id)
-            short_id = keg_id[:4]
-            keg_data = data_state.get(keg_id, {})
-
-            # ---------- 2) Resolve name ----------
-            name_from_call = call.data.get("name")
-            if name_from_call:
-                keg_name = str(name_from_call)
+            name_state = hass.states.get("input_text.beer_keg_name")
+            if name_state and name_state.state not in ("unknown", "unavailable", ""):
+                keg_name = name_state.state
             else:
-                name_entity = call.data.get("name_entity")
-                name_val = _get_ent_state(name_entity)
-                if name_val:
-                    keg_name = name_val
-                else:
-                    legacy_name_ent = f"text.keg_{short_id}_keg_name"
-                    legacy_name_val = _get_ent_state(legacy_name_ent)
-                    if legacy_name_val:
-                        keg_name = legacy_name_val
-                    else:
-                        keg_name = keg_data.get("name") or keg_id
+                keg_name = keg_id
 
-            # ---------- 3) Resolve numeric fields ----------
-
-            def _resolve_float(
-                direct_key: str,
-                entity_key: str,
-                data_key: str,
-                default: float,
-            ) -> float:
-                if direct_key in call.data:
-                    try:
-                        return float(call.data.get(direct_key))
-                    except (TypeError, ValueError):
-                        pass
-
-                ent_id = call.data.get(entity_key)
-                if ent_id:
-                    return _get_ent_float(ent_id, default)
-
-                val = keg_data.get(data_key)
+            def _get_float(ent_id: str, default: float = 0.0) -> float:
+                ent = hass.states.get(ent_id)
+                if not ent:
+                    return default
                 try:
-                    return float(val)
+                    return float(ent.state)
                 except (TypeError, ValueError):
                     return default
 
-            full_weight = _resolve_float(
-                "full_weight",
-                "full_weight_entity",
-                "full_weight",
-                state.get("default_full", DEFAULT_FULL_WEIGHT),
-            )
-            weight_cal = _resolve_float(
-                "weight_calibrate",
-                "weight_calibrate_entity",
-                "weight_calibrate",
-                0.0,
-            )
-            temp_cal = _resolve_float(
-                "temperature_calibrate",
-                "temperature_calibrate_entity",
-                "temperature_calibrate",
-                0.0,
-            )
+            full_weight = _get_float("input_number.keg_cfg_full_weight_kg")
+            weight_cal = _get_float("input_number.keg_cfg_weight_cal")
+            temp_cal = _get_float("input_number.keg_cfg_temp_cal_c")
 
             payload = {
                 "id": keg_id,
@@ -836,13 +576,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "temperature_calibrate": temp_cal,
             }
 
-            _LOGGER.info(
-                "%s: calibrating keg %s with payload: %s",
-                DOMAIN,
-                keg_id,
-                payload,
-            )
-
             try:
                 async with aiohttp.ClientSession() as http_sess:
                     async with http_sess.post(url, json=payload) as resp:
@@ -851,7 +584,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                             raise RuntimeError(f"HTTP {resp.status}: {body[:200]}")
 
                 pn_create(hass, "Calibration saved.", title="Beer Keg")
-
                 await refresh_kegs(ServiceCall(DOMAIN, "refresh_kegs", {}))
 
             except Exception as e:
@@ -861,119 +593,219 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.services.async_register(DOMAIN, "calibrate_keg", calibrate_keg)
 
         async def set_display_units(call: ServiceCall) -> None:
-            """
-            Change weight / temperature / pour units and persist them.
-            """
-            weight_unit = call.data.get("weight_unit") or state["display_units"].get(
-                "weight", "kg"
-            )
-            temp_unit = call.data.get("temp_unit") or state["display_units"].get(
-                "temp", "°C"
-            )
-            pour_unit = call.data.get("pour_unit") or state["display_units"].get(
-                "pour", "oz"
-            )
+            weight_unit = call.data.get("weight_unit")
+            temp_unit = call.data.get("temp_unit")
+
+            if weight_unit is None:
+                for ent_id in WEIGHT_UNIT_ENTITIES:
+                    ent = hass.states.get(ent_id)
+                    if ent and ent.state in ("kg", "lb"):
+                        weight_unit = ent.state
+                        break
+
+            if temp_unit is None:
+                for ent_id in TEMP_UNIT_ENTITIES:
+                    ent = hass.states.get(ent_id)
+                    if ent and ent.state in ("°C", "°F"):
+                        temp_unit = ent.state
+                        break
 
             if weight_unit not in ("kg", "lb"):
-                weight_unit = "kg"
+                weight_unit = state["display_units"].get("weight", "kg")
             if temp_unit not in ("°C", "°F"):
-                temp_unit = "°C"
-            if pour_unit not in ("oz", "ml"):
-                pour_unit = "oz"
+                temp_unit = state["display_units"].get("temp", "°C")
 
-            state["display_units"] = {
-                "weight": weight_unit,
-                "temp": temp_unit,
-                "pour": pour_unit,
-            }
-
-            # Persist so it survives reboot (along with all other prefs)
-            await state["prefs_store"].async_save(
-                {
-                    "display_units": state["display_units"],
-                    "keg_config": state.get("keg_config", {}),
-                    "tap_text": state.get("tap_text", {}),
-                    "tap_numbers": state.get("tap_numbers", {}),
-                    "noise_deadband_kg": state.get("noise_deadband_kg"),
-                    "smoothing_alpha": state.get("smoothing_alpha"),
-                }
-            )
+            state["display_units"] = {"weight": weight_unit, "temp": temp_unit}
+            await state["prefs_store"].async_save({"display_units": state["display_units"]})
 
             for keg_id in list(state.get("data", {}).keys()):
                 hass.bus.async_fire(f"{DOMAIN}_update", {"keg_id": keg_id})
 
             pn_create(
                 hass,
-                f"Display units set to weight={weight_unit}, temp={temp_unit}, pour={pour_unit}",
+                f"Display units set to {weight_unit}, {temp_unit}",
                 title="Beer Keg",
             )
 
         hass.services.async_register(DOMAIN, "set_display_units", set_display_units)
 
-        async def on_stop(event) -> None:
-            """Save history/prefs and cancel background tasks on shutdown."""
-            try:
-                await state["history_store"].async_save(
-                    state["history"][-MAX_LOG_ENTRIES:]
-                )
-                await state["prefs_store"].async_save(
-                    {
-                        "display_units": state["display_units"],
-                        "keg_config": state.get("keg_config", {}),
-                        "tap_text": state.get("tap_text", {}),
-                        "tap_numbers": state.get("tap_numbers", {}),
-                        "noise_deadband_kg": state.get("noise_deadband_kg"),
-                        "smoothing_alpha": state.get("smoothing_alpha"),
-                    }
-                )
-            except Exception as e:  # pragma: no cover - best effort
-                _LOGGER.warning("%s: failed to persist state on stop: %s", DOMAIN, e)
+        # ---------- Command API Services (new server only; graceful 404 on old server)
 
-            # Cancel background tasks (WS loop, pinger, etc.)
-            for task in list(state.get("background_tasks", [])):
-                if not task.done():
-                    task.cancel()
+        def _resolve_cmd_keg_id(call: ServiceCall) -> str | None:
+            keg_id = call.data.get("id")
+            if keg_id:
+                return str(keg_id)
+            dev_state = hass.states.get("select.keg_device")
+            if dev_state and dev_state.state not in ("unknown", "unavailable", ""):
+                return dev_state.state
+            return None
+
+        async def _post_keg_cmd(keg_id: str, cmd: str, payload: dict | None = None) -> tuple[int, str]:
+            base = _rest_base_from_ws(state["ws_url"])
+            url = f"{base}/api/kegs/{keg_id}/{cmd}"
+            session = async_get_clientsession(hass)
+            async with session.post(url, json=payload or {}) as resp:
+                txt = await resp.text()
+                return resp.status, txt
+
+        async def _cmd_result(keg_id: str, cmd: str, status: int, body: str) -> None:
+            if status == 404:
+                pn_create(
+                    hass,
+                    f"Command API not supported by this server (404) for '{cmd}'.",
+                    title="Beer Keg Command",
+                )
+                return
+            if status >= 300:
+                pn_create(hass, f"Command '{cmd}' failed for {keg_id}: HTTP {status}\n{body}", title="Beer Keg Command")
+                return
+            pn_create(hass, f"Command '{cmd}' sent to {keg_id}", title="Beer Keg Command")
+
+        _SCHEMA_ID_ONLY = vol.Schema({vol.Optional("id"): cv.string})
+        _SCHEMA_FLOAT_VALUE = vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.Coerce(float)})
+        _SCHEMA_INT_VALUE = vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.Coerce(int)})
+        _SCHEMA_STR_VALUE = vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): cv.string})
+
+        async def keg_tare(call: ServiceCall) -> None:
+            keg_id = _resolve_cmd_keg_id(call)
+            if not keg_id:
+                pn_create(hass, "No keg selected.", title="Beer Keg Command")
+                return
+            status, body = await _post_keg_cmd(keg_id, "tare")
+            await _cmd_result(keg_id, "tare", status, body)
+
+        async def keg_set_empty_keg(call: ServiceCall) -> None:
+            keg_id = _resolve_cmd_keg_id(call)
+            if not keg_id:
+                pn_create(hass, "No keg selected.", title="Beer Keg Command")
+                return
+            status, body = await _post_keg_cmd(keg_id, "empty-keg", {"value": float(call.data["value"])})
+            await _cmd_result(keg_id, "empty-keg", status, body)
+
+        async def keg_set_max_volume(call: ServiceCall) -> None:
+            keg_id = _resolve_cmd_keg_id(call)
+            if not keg_id:
+                pn_create(hass, "No keg selected.", title="Beer Keg Command")
+                return
+            status, body = await _post_keg_cmd(keg_id, "max-keg-volume", {"value": float(call.data["value"])})
+            await _cmd_result(keg_id, "max-keg-volume", status, body)
+
+        async def keg_set_temp_offset(call: ServiceCall) -> None:
+            keg_id = _resolve_cmd_keg_id(call)
+            if not keg_id:
+                pn_create(hass, "No keg selected.", title="Beer Keg Command")
+                return
+            status, body = await _post_keg_cmd(keg_id, "temperature-offset", {"value": float(call.data["value"])})
+            await _cmd_result(keg_id, "temperature-offset", status, body)
+
+        async def keg_calibrate_known(call: ServiceCall) -> None:
+            keg_id = _resolve_cmd_keg_id(call)
+            if not keg_id:
+                pn_create(hass, "No keg selected.", title="Beer Keg Command")
+                return
+            status, body = await _post_keg_cmd(keg_id, "calibrate-known-weight", {"value": float(call.data["value"])})
+            await _cmd_result(keg_id, "calibrate-known-weight", status, body)
+
+        async def keg_set_beer_style(call: ServiceCall) -> None:
+            keg_id = _resolve_cmd_keg_id(call)
+            if not keg_id:
+                pn_create(hass, "No keg selected.", title="Beer Keg Command")
+                return
+            status, body = await _post_keg_cmd(keg_id, "beer-style", {"value": str(call.data["value"])})
+            await _cmd_result(keg_id, "beer-style", status, body)
+
+        async def keg_set_date(call: ServiceCall) -> None:
+            keg_id = _resolve_cmd_keg_id(call)
+            if not keg_id:
+                pn_create(hass, "No keg selected.", title="Beer Keg Command")
+                return
+            status, body = await _post_keg_cmd(keg_id, "date", {"value": str(call.data["value"])})
+            await _cmd_result(keg_id, "date", status, body)
+
+        async def keg_set_unit(call: ServiceCall) -> None:
+            keg_id = _resolve_cmd_keg_id(call)
+            if not keg_id:
+                pn_create(hass, "No keg selected.", title="Beer Keg Command")
+                return
+            status, body = await _post_keg_cmd(keg_id, "unit", {"value": str(call.data["value"]).lower()})
+            await _cmd_result(keg_id, "unit", status, body)
+
+        async def keg_set_measure_unit(call: ServiceCall) -> None:
+            keg_id = _resolve_cmd_keg_id(call)
+            if not keg_id:
+                pn_create(hass, "No keg selected.", title="Beer Keg Command")
+                return
+            status, body = await _post_keg_cmd(keg_id, "measure-unit", {"value": str(call.data["value"]).lower()})
+            await _cmd_result(keg_id, "measure-unit", status, body)
+
+        async def keg_set_mode(call: ServiceCall) -> None:
+            keg_id = _resolve_cmd_keg_id(call)
+            if not keg_id:
+                pn_create(hass, "No keg selected.", title="Beer Keg Command")
+                return
+            status, body = await _post_keg_cmd(keg_id, "keg-mode", {"value": str(call.data["value"]).lower()})
+            await _cmd_result(keg_id, "keg-mode", status, body)
+
+        async def keg_set_sensitivity(call: ServiceCall) -> None:
+            keg_id = _resolve_cmd_keg_id(call)
+            if not keg_id:
+                pn_create(hass, "No keg selected.", title="Beer Keg Command")
+                return
+            status, body = await _post_keg_cmd(keg_id, "sensitivity", {"value": int(call.data["value"])})
+            await _cmd_result(keg_id, "sensitivity", status, body)
+
+        hass.services.async_register(DOMAIN, "keg_tare", keg_tare, schema=_SCHEMA_ID_ONLY)
+        hass.services.async_register(DOMAIN, "keg_set_empty_keg_weight", keg_set_empty_keg, schema=_SCHEMA_FLOAT_VALUE)
+        hass.services.async_register(DOMAIN, "keg_set_max_keg_volume", keg_set_max_volume, schema=_SCHEMA_FLOAT_VALUE)
+        hass.services.async_register(DOMAIN, "keg_set_temperature_offset", keg_set_temp_offset, schema=_SCHEMA_FLOAT_VALUE)
+        hass.services.async_register(DOMAIN, "keg_calibrate_known_weight", keg_calibrate_known, schema=_SCHEMA_FLOAT_VALUE)
+        hass.services.async_register(DOMAIN, "keg_set_beer_style", keg_set_beer_style, schema=_SCHEMA_STR_VALUE)
+        hass.services.async_register(DOMAIN, "keg_set_date", keg_set_date, schema=_SCHEMA_STR_VALUE)
+        hass.services.async_register(
+            DOMAIN,
+            "keg_set_unit_system",
+            keg_set_unit,
+            schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.In(["metric", "us"])}),
+        )
+        hass.services.async_register(
+            DOMAIN,
+            "keg_set_measure_unit",
+            keg_set_measure_unit,
+            schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.In(["weight", "volume"])}),
+        )
+        hass.services.async_register(
+            DOMAIN,
+            "keg_set_mode",
+            keg_set_mode,
+            schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.In(["beer", "co2"])}),
+        )
+        hass.services.async_register(DOMAIN, "keg_set_sensitivity", keg_set_sensitivity, schema=_SCHEMA_INT_VALUE)
+
+        async def on_stop(event) -> None:
+            await state["history_store"].async_save(state["history"][-MAX_LOG_ENTRIES:])
+            await state["prefs_store"].async_save({"display_units": state["display_units"]})
 
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, on_stop)
 
         # ---------- Start after HA is running
 
-        async def _start_after_started(event: Any | None = None) -> None:
+        async def _start_after_started(event=None) -> None:
             await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
             try:
                 await fetch_devices()
                 initial = await fetch_kegs()
                 for raw in initial:
-                    norm = _normalize_keg_dict(raw)
+                    norm = _normalize_keg_dict(raw, state)
                     await _publish_keg(norm)
-                _LOGGER.info(
-                    "%s: Initial REST refresh found %d kegs",
-                    DOMAIN,
-                    len(initial),
-                )
+                _LOGGER.info("%s: Initial REST refresh found %d kegs", DOMAIN, len(initial))
             except Exception as e:
                 _LOGGER.warning("%s: Initial refresh failed: %s", DOMAIN, e)
 
-            # start websocket loop and track the task
-            ws_task = hass.async_create_task(connect_websocket())
-            state["background_tasks"].append(ws_task)
-
-            async_track_time_interval(
-                hass, rest_poll, timedelta(seconds=REST_POLL_SECONDS)
-            )
-            async_track_time_interval(
-                hass, watchdog, timedelta(seconds=10)
-            )
-            async_track_time_interval(
-                hass, _periodic_devices, timedelta(seconds=DEVICES_REFRESH_SEC)
-            )
-
-            # Reset daily_consumed at local midnight
-            async_track_time_change(
-                hass, reset_daily_consumption, hour=0, minute=0, second=0
-            )
-
+            hass.async_create_task(connect_websocket())
+            async_track_time_interval(hass, rest_poll, timedelta(seconds=REST_POLL_SECONDS))
+            async_track_time_interval(hass, watchdog, timedelta(seconds=10))
+            async_track_time_interval(hass, _periodic_devices, timedelta(seconds=DEVICES_REFRESH_SEC))
             _LOGGER.info("%s: started background tasks", DOMAIN)
 
         if hass.state == "RUNNING":
@@ -981,18 +813,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         else:
             hass.bus.async_listen_once("homeassistant_started", _start_after_started)
 
-        _LOGGER.info(
-            "%s: setup complete (WS+REST+poll+watchdog+devices+services)", DOMAIN
-        )
+        _LOGGER.info("%s: setup complete (WS+REST+poll+watchdog+devices+services)", DOMAIN)
         return True
 
-    except Exception as e:  # pragma: no cover - top-level safety net
+    except Exception as e:
         _LOGGER.exception("%s: setup_entry crashed: %s", DOMAIN, e)
         return False
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
     state = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded and state is not None:
