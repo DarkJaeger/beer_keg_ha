@@ -42,8 +42,9 @@ SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
         "key": "liters_left",
         "icon": "mdi:cup",
         "device_class": "volume",
-        "state_class": "measurement",
+        "state_class": None,  # FIX: remaining volume is a "level", not a measurement/total
     },
+
 
     # --- FILL LEVEL ---
     "fill_percent": {

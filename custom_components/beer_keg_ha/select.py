@@ -118,17 +118,18 @@ class BeerKegDeviceSelect(SelectEntity):
         self.entry = entry
         self._state_ref = state_ref
 
-        # This will normally become entity_id: select.keg_device
         self._attr_name = "Keg Device"
         self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}_keg_device"
 
-        # store the last selected device in integration state
+        # Cache options so we only update capabilities when the list changes
+        self._attr_options: list[str] = []
+        self._last_options: list[str] = []
+
         if "selected_device" not in self._state_ref:
             self._state_ref["selected_device"] = None
 
     @property
     def device_info(self) -> DeviceInfo:
-        """Group this under 'Beer Keg Settings'."""
         return DeviceInfo(
             identifiers={(DOMAIN, f"{self.entry.entry_id}_settings")},
             name="Beer Keg Settings",
@@ -136,49 +137,68 @@ class BeerKegDeviceSelect(SelectEntity):
             model="WebSocket + REST",
         )
 
-    @property
-    def options(self) -> list[str]:
-        """Return list of keg device IDs known by the integration."""
+    def _read_devices(self) -> list[str]:
         devices = self._state_ref.get("devices") or []
-        return list(devices)
+        # normalize + stable ordering to prevent needless "changed"
+        cleaned = [str(d) for d in devices if d not in (None, "", "unknown", "unavailable")]
+        # keep stable order but de-dupe
+        seen = set()
+        out: list[str] = []
+        for d in cleaned:
+            if d not in seen:
+                seen.add(d)
+                out.append(d)
+        return out
 
     @property
     def current_option(self) -> str | None:
-        """Current selected keg id."""
         selected = self._state_ref.get("selected_device")
-        if selected in self.options:
+        if selected in self._attr_options:
             return selected
-        # Fallback: first option if nothing selected yet
-        if self.options:
-            return self.options[0]
+        if self._attr_options:
+            return self._attr_options[0]
         return None
 
     async def async_select_option(self, option: str) -> None:
-        """Handle user picking a keg from the dropdown."""
-        if option not in self.options:
-            _LOGGER.warning(
-                "%s: Attempt to select unknown keg device: %s",
-                DOMAIN,
-                option,
-            )
+        if option not in self._attr_options:
+            _LOGGER.warning("%s: Attempt to select unknown keg device: %s", DOMAIN, option)
             return
-
         self._state_ref["selected_device"] = option
         self.async_write_ha_state()
 
     async def async_added_to_hass(self) -> None:
-        """Refresh when devices list changes."""
+        """Refresh when devices list changes, but only if it *actually* changed."""
+        # Initialize options once
+        new_opts = self._read_devices()
+        self._attr_options = new_opts
+        self._last_options = list(new_opts)
+
+        # If no selected device yet, pick first
+        if self._state_ref.get("selected_device") not in self._attr_options:
+            self._state_ref["selected_device"] = self._attr_options[0] if self._attr_options else None
+
+        self.async_write_ha_state()
 
         @callback
         def _handle_devices_update(event) -> None:
-            # A devices list update means our options may have changed
+            new = self._read_devices()
+
+            # Only update capabilities if changed
+            if new == self._last_options:
+                return
+
+            self._attr_options = new
+            self._last_options = list(new)
+
+            # Ensure selection stays valid
+            if self._state_ref.get("selected_device") not in self._attr_options:
+                self._state_ref["selected_device"] = self._attr_options[0] if self._attr_options else None
+
             self.async_write_ha_state()
 
-        # Listen for /api/kegs/devices updates from __init__.py
         self.async_on_remove(
             self.hass.bus.async_listen(DEVICES_UPDATE_EVENT, _handle_devices_update)
         )
-
 
 # -------------------------------------------------------------------
 # GLOBAL UNIT SELECTS
