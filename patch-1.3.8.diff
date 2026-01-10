@@ -1,0 +1,1092 @@
+diff --git a/custom_components/beer_keg_ha/manifest.json b/custom_components/beer_keg_ha/manifest.json
+index 3c08c8a..50c8e2a 100644
+--- a/custom_components/beer_keg_ha/manifest.json
++++ b/custom_components/beer_keg_ha/manifest.json
+@@ -1 +1,13 @@
+-{ "domain": "beer_keg_ha", "name": "Beer Keg Scale", "codeowners": ["@DarkJaeger"], "config_flow": true, "documentation": "https://github.com/DarkJaeger/beer-keg-ha", "iot_class": "local_push", "issue_tracker": "https://github.com/DarkJaeger/beer-keg-ha/issues", "loggers": ["custom_components.beer_keg_ha"], "version": "1.3.7" }
++{
++  "domain": "beer_keg_ha",
++  "name": "Beer Keg Scale",
++  "codeowners": ["@DarkJaeger"],
++  "config_flow": true,
++  "documentation": "https://github.com/DarkJaeger/beer-keg-ha",
++  "iot_class": "local_push",
++  "issue_tracker": "https://github.com/DarkJaeger/beer-keg-ha/issues",
++  "loggers": ["custom_components.beer_keg_ha"],
++  "version": "1.3.8"
++}
+diff --git a/custom_components/beer_keg_ha/const.py b/custom_components/beer_keg_ha/const.py
+index 5a2ab9b..9d11a9a 100644
+--- a/custom_components/beer_keg_ha/const.py
++++ b/custom_components/beer_keg_ha/const.py
+@@ -1 +1,31 @@
+-DOMAIN = "beer_keg_ha" # Config keys CONF_WS_URL = "ws_url" CONF_EMPTY_WEIGHT = "empty_weight" CONF_DEFAULT_FULL_WEIGHT = "default_full_weight" CONF_POUR_THRESHOLD = "pour_threshold" CONF_PER_KEG_FULL = "per_keg_full" # Density-aware fill% CONF_FULL_VOLUME_L = "full_volume_liters" CONF_BEER_SG = "beer_specific_gravity" # Defaults DEFAULT_EMPTY_WEIGHT = 0.0 DEFAULT_FULL_WEIGHT = 19.0 DEFAULT_POUR_THRESHOLD = 0.15 DEFAULT_FULL_VOLUME_L = 19.0 DEFAULT_BEER_SG = 1.010 WATER_DENSITY_KG_PER_L = 0.998 # History MAX_LOG_ENTRIES = 500
++DOMAIN = "beer_keg_ha"
++
++# Config keys
++CONF_WS_URL = "ws_url"
++CONF_EMPTY_WEIGHT = "empty_weight"
++CONF_DEFAULT_FULL_WEIGHT = "default_full_weight"
++CONF_POUR_THRESHOLD = "pour_threshold"
++CONF_PER_KEG_FULL = "per_keg_full"
++
++# Density-aware fill%
++CONF_FULL_VOLUME_L = "full_volume_liters"
++CONF_BEER_SG = "beer_specific_gravity"
++
++# Defaults
++DEFAULT_EMPTY_WEIGHT = 0.0
++DEFAULT_FULL_WEIGHT = 19.0
++DEFAULT_POUR_THRESHOLD = 0.15
++DEFAULT_FULL_VOLUME_L = 19.0
++DEFAULT_BEER_SG = 1.010
++WATER_DENSITY_KG_PER_L = 0.998
++
++# History
++MAX_LOG_ENTRIES = 500
++
++# Runtime keys / diagnostics
++ATTR_PLAATO_API_VERSION = "plaato_api_version"   # "v1" | "v2"
++ATTR_PLAATO_API_V2 = "plaato_api_v2"             # bool
+diff --git a/custom_components/beer_keg_ha/__init__.py b/custom_components/beer_keg_ha/__init__.py
+index 2b8b27a..fa9fe5b 100644
+--- a/custom_components/beer_keg_ha/__init__.py
++++ b/custom_components/beer_keg_ha/__init__.py
+@@ -1,7 +1,78 @@
+-from __future__ import annotations import asyncio import json import logging import os from datetime import datetime, timedelta, timezone from typing import Any, Dict, List from urllib.parse import urlparse, urlunparse import aiohttp from homeassistant.components.persistent_notification import async_create as pn_create from homeassistant.config_entries import ConfigEntry from homeassistant.const import EVENT_HOMEASSISTANT_STOP from homeassistant.core import HomeAssistant, ServiceCall from homeassistant.helpers import config_validation as cv from homeassistant.helpers.event import ( async_track_time_interval, async_track_time_change, ) from homeassistant.helpers.storage import Store from .const import ( DOMAIN, CONF_WS_URL, CONF_EMPTY_WEIGHT, CONF_DEFAULT_FULL_WEIGHT, CONF_POUR_THRESHOLD, CONF_PER_KEG_FULL, MAX_LOG_ENTRIES, DEFAULT_EMPTY_WEIGHT, DEFAULT_FULL_WEIGHT, DEFAULT_POUR_THRESHOLD, ) _LOGGER = logging.getLogger(__name__) # Platforms we load PLATFORMS = ["sensor", "select", "number", "text", "date"] # hassfest requirement CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN) KG_TO_OZ = 35.274 REST_POLL_SECONDS = 10 WS_PING_SEC = 30 DATA_STALE_SEC = 45 DEVICES_REFRESH_SEC = 60 LAST_UPDATE_KEY = "last_update_ts" DEVICES_UPDATE_EVENT = f"{DOMAIN}_devices_update" # Optional density keys try: from .const import ( CONF_FULL_VOLUME_L, CONF_BEER_SG, DEFAULT_BEER_SG, DEFAULT_FULL_VOLUME_L, WATER_DENSITY_KG_PER_L, ) DENSITY_AWARE = True except Exception: # pragma: no cover - optional import DENSITY_AWARE = False CONF_FULL_VOLUME_L = "full_volume_liters" CONF_BEER_SG = "beer_specific_gravity" DEFAULT_FULL_VOLUME_L = 19.0 DEFAULT_BEER_SG = 1.010 WATER_DENSITY_KG_PER_L = 0.998 def _coerce_float(val: Any, default: float = 0.0) -> float: try: return float(val) except Exception: return default def _normalize_keg_dict(keg: dict) -> dict: """Normalize keg dict from WS/REST payloads into a common structure.""" keg_id = str(keg.get("id", "unknown")).lower().replace(" ", "_") weight = _coerce_float(keg.get("weight")) temp = keg.get("temperature") temp = _coerce_float(temp) if temp is not None else None full_w = _coerce_float(keg.get("full_weight"), default=0.0) name = keg.get("name") or keg_id return { "keg_id": keg_id, "name": name, "weight": weight, "temperature": temp, "full_weight": full_w if full_w > 0 else None, "weight_calibrate": _coerce_float(keg.get("weight_calibrate")), "temperature_calibrate": _coerce_float(keg.get("temperature_calibrate")), } def _rest_base_from_ws(ws: str) -> str: """Build http(s) base URL from ws:// or wss://.""" u = urlparse(ws) scheme = "http" if u.scheme == "ws" else "https" if u.scheme == "wss" else "http" return urlunparse((scheme, u.netloc, "", "", "", "")) async def async_setup(hass: HomeAssistant, config: dict) -> bool: return True async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool: try: ws_url: str | None = entry.data.get(CONF_WS_URL) if not ws_url: _LOGGER.error("%s: Missing ws_url", DOMAIN) return False # Normalize the WS URL: # - Add ws:// if scheme is missing # - If no path is present, default to /ws raw_ws = ws_url.strip() from urllib.parse import urlparse, urlunparse u = urlparse(raw_ws) # If user entered just "10.10.12.23:8085" or similar if not u.scheme and u.path and not u.netloc: raw_ws = f"ws://{raw_ws}" u = urlparse(raw_ws) scheme = u.scheme or "ws" netloc = u.netloc or u.path path = u.path or "" if not path or path == "/": # Default to /ws when no explicit path is given path = "/ws" ws_url_normalized = urlunparse((scheme, netloc, path, "", "", "")) if ws_url_normalized != ws_url: _LOGGER.info( "%s: Normalized WS URL from %s to %s", DOMAIN, ws_url, ws_url_normalized, ) ws_url = ws_url_normalized opts = entry.options or {} empty_weight = float(opts.get(CONF_EMPTY_WEIGHT, DEFAULT_EMPTY_WEIGHT)) default_full = float(opts.get(CONF_DEFAULT_FULL_WEIGHT, DEFAULT_FULL_WEIGHT)) pour_threshold = float(opts.get(CONF_POUR_THRESHOLD, DEFAULT_POUR_THRESHOLD)) # Optional density-aware computed full weight (global default) if DENSITY_AWARE: full_volume_l = float(opts.get(CONF_FULL_VOLUME_L, DEFAULT_FULL_VOLUME_L)) beer_sg = float(opts.get(CONF_BEER_SG, DEFAULT_BEER_SG)) computed_full_from_sg = full_volume_l * beer_sg * WATER_DENSITY_KG_PER_L # kg else: full_volume_l = DEFAULT_FULL_VOLUME_L beer_sg = DEFAULT_BEER_SG computed_full_from_sg = None # Per-keg full weight overrides (JSON of id->kg) per_keg_full: Dict[str, float] = {} raw_mapping = opts.get(CONF_PER_KEG_FULL) if raw_mapping: try: per_keg_full = { str(k).lower().replace(" ", "_"): float(v) for k, v in json.loads(raw_mapping).items() } except Exception as e: _LOGGER.warning("%s: Invalid per_keg_full mapping: %s", DOMAIN, e) hass.data.setdefault(DOMAIN, {}) history_store: Store = Store(hass, 1, f"{DOMAIN}_history") prefs_store: Store = Store(hass, 1, f"{DOMAIN}_prefs") # Main runtime state for this config entry state: Dict[str, Any] = { "ws_url": ws_url, "empty_weight": empty_weight, "default_full": default_full, "pour_threshold": pour_threshold, "per_keg_full": per_keg_full, "full_volume_l": full_volume_l, "beer_sg": beer_sg, "computed_full_from_sg": computed_full_from_sg, "kegs": {}, # runtime per-keg stats "data": {}, # values exposed to entities "history": [], "devices": [], "display_units": { # may be overridden by prefs below "weight": "kg", "temp": "°C", "pour": "oz", # last_pour / daily_consumption base unit }, "tap_text": {}, # tap config (if you use it) "tap_numbers": {}, # Global smoothing config (overridable via Number entities) "noise_deadband_kg": float(opts.get("noise_deadband_kg", 0.0)), "smoothing_alpha": float(opts.get("smoothing_alpha", 1.0)), # Optional per-keg config that should survive restart "keg_config": {}, "history_store": history_store, "prefs_store": prefs_store, "background_tasks": [], # track long-running tasks (WS loop, pinger, etc.) LAST_UPDATE_KEY: None, } hass.data[DOMAIN][entry.entry_id] = state # ---- load history from storage loaded_history = await history_store.async_load() if isinstance(loaded_history, list): state["history"] = loaded_history _LOGGER.info("%s: Loaded %d pour records", DOMAIN, len(state["history"])) # Recompute today's daily stats & last pour per keg from history def _rebuild_daily_from_history() -> None: """ Build per-keg: - daily_consumed (oz for 'today') - last_pour (oz) - last_pour_time (string timestamp) based on stored history.
++from __future__ import annotations
++
++import asyncio
++import json
++import logging
++import os
++from datetime import datetime, timedelta, timezone
++from typing import Any, Dict, List
++from urllib.parse import urlparse, urlunparse
++
++import aiohttp
++import voluptuous as vol
++
++from homeassistant.components.persistent_notification import async_create as pn_create
++from homeassistant.config_entries import ConfigEntry
++from homeassistant.const import EVENT_HOMEASSISTANT_STOP
++from homeassistant.core import HomeAssistant, ServiceCall
++from homeassistant.helpers import config_validation as cv
++from homeassistant.helpers.aiohttp_client import async_get_clientsession
++from homeassistant.helpers.event import async_track_time_change, async_track_time_interval
++from homeassistant.helpers.storage import Store
++
++from .const import (
++    ATTR_PLAATO_API_V2,
++    ATTR_PLAATO_API_VERSION,
++    CONF_DEFAULT_FULL_WEIGHT,
++    CONF_EMPTY_WEIGHT,
++    CONF_PER_KEG_FULL,
++    CONF_POUR_THRESHOLD,
++    CONF_WS_URL,
++    DEFAULT_EMPTY_WEIGHT,
++    DEFAULT_FULL_WEIGHT,
++    DEFAULT_POUR_THRESHOLD,
++    DOMAIN,
++    MAX_LOG_ENTRIES,
++)
++
++_LOGGER = logging.getLogger(__name__)
++
++# Platforms we load
++PLATFORMS = ["sensor", "select", "number", "text", "date"]
++
++# hassfest requirement
++CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
++
++KG_TO_OZ = 35.274
++REST_POLL_SECONDS = 10
++WS_PING_SEC = 30
++DATA_STALE_SEC = 45
++DEVICES_REFRESH_SEC = 60
++
++LAST_UPDATE_KEY = "last_update_ts"
++DEVICES_UPDATE_EVENT = f"{DOMAIN}_devices_update"
++
++# Optional density keys
++try:
++    from .const import (
++        CONF_BEER_SG,
++        CONF_FULL_VOLUME_L,
++        DEFAULT_BEER_SG,
++        DEFAULT_FULL_VOLUME_L,
++        WATER_DENSITY_KG_PER_L,
++    )
++
++    DENSITY_AWARE = True
++except Exception:  # pragma: no cover
++    DENSITY_AWARE = False
++    CONF_FULL_VOLUME_L = "full_volume_liters"
++    CONF_BEER_SG = "beer_specific_gravity"
++    DEFAULT_FULL_VOLUME_L = 19.0
++    DEFAULT_BEER_SG = 1.010
++    WATER_DENSITY_KG_PER_L = 0.998
++
++
++def _coerce_float(val: Any, default: float = 0.0) -> float:
++    try:
++        return float(val)
++    except Exception:
++        return default
++
++
++def _normalize_keg_dict(keg: dict) -> dict:
++    """Normalize keg dict from WS/REST payloads into a common structure.
++
++    Supports:
++    - API v1 (legacy): weight/temperature/full_weight
++    - API v2 (next): amount_left/percent_of_beer_left/keg_temperature/...
++    """
++    keg_id = str(keg.get("id", "unknown")).lower().replace(" ", "_")
++
++    # --- API v2 detection (open-plaato-keg next enhanced model) ---
++    # If we see v2-only keys, treat as v2.
++    is_v2 = "amount_left" in keg or "percent_of_beer_left" in keg or "keg_temperature" in keg
++    api_version = "v2" if is_v2 else "v1"
++
++    # weight/temp (v1) or keg_temperature (v2)
++    weight = _coerce_float(keg.get("weight"))
++    temp = keg.get("temperature")
++    if temp is None and is_v2:
++        temp = keg.get("keg_temperature")
++    temp = _coerce_float(temp) if temp is not None else None
++
++    # Full weight is only meaningful for v1 fill% math
++    full_w = _coerce_float(keg.get("full_weight"), default=0.0)
++
++    # v2: liters remaining (amount_left) + percent remaining
++    liters_left = None
++    percent_left = None
++    if is_v2:
++        liters_left = _coerce_float(keg.get("amount_left"), default=None)  # already liters
++        percent_left = _coerce_float(keg.get("percent_of_beer_left"), default=None)
++
++    name = keg.get("name") or keg.get("my_beer_style") or keg_id
++
++    return {
++        "keg_id": keg_id,
++        "name": name,
++        "weight": weight,
++        "temperature": temp,
++        "full_weight": full_w if full_w > 0 else None,
++        "weight_calibrate": _coerce_float(keg.get("weight_calibrate")),
++        "temperature_calibrate": _coerce_float(keg.get("temperature_calibrate")),
++        # v2 additions (native units)
++        "liters_left": liters_left,
++        "percent_left": percent_left,
++        "api_version": api_version,
++    }
++
++
++def _rest_base_from_ws(ws: str) -> str:
++    """Build http(s) base URL from ws:// or wss://."""
++    u = urlparse(ws)
++    scheme = "http" if u.scheme == "ws" else "https" if u.scheme == "wss" else "http"
++    return urlunparse((scheme, u.netloc, "", "", "", ""))
++
++
++async def async_setup(hass: HomeAssistant, config: dict) -> bool:
++    return True
+diff --git a/custom_components/beer_keg_ha/__init__.py b/custom_components/beer_keg_ha/__init__.py
+index fa9fe5b..8bd69e8 100644
+--- a/custom_components/beer_keg_ha/__init__.py
++++ b/custom_components/beer_keg_ha/__init__.py
+@@ -200,6 +200,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+         state: Dict[str, Any] = {
+             "ws_url": ws_url,
+             "empty_weight": empty_weight,
++            # Auto-detected from incoming payloads
++            ATTR_PLAATO_API_V2: False,
++            ATTR_PLAATO_API_VERSION: "v1",
+             "default_full": default_full,
+             "pour_threshold": pour_threshold,
+             "per_keg_full": per_keg_full,
+@@ -420,6 +424,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+         async def _publish_keg(norm: dict) -> None:
+             """Normalize and push one keg's data into integration state."""
+             keg_id = norm["keg_id"]
++
++            # Detect server API version/capability once we see first payload
++            if norm.get("api_version") == "v2":
++                state[ATTR_PLAATO_API_V2] = True
++                state[ATTR_PLAATO_API_VERSION] = "v2"
++
+             weight_raw = norm["weight"]
+             temp = norm["temperature"]
+@@ -640,6 +654,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+             # store computed values for entities
+             state.setdefault("data", {}).setdefault(keg_id, {})
+             state["data"][keg_id].update(
+                 {
+                     "id": keg_id,
+                     "name": norm.get("name") or keg_id,
+                     "weight": round(float(info.get("last_weight", 0.0)), 3),
+                     "temperature": temp,
+                     "full_weight": info.get("full_weight"),
+                     "fill_percent": round(float(info.get("fill_percent", 0.0)), 1),
+                     "last_pour": round(float(info.get("last_pour", 0.0)), 3),
+                     "daily_consumed": round(float(info.get("daily_consumed", 0.0)), 3),
++                    # API v2 native liters remaining (None for v1 servers)
++                    "liters_left": norm.get("liters_left"),
++                    # API v2 percent remaining (optional)
++                    "percent_left": norm.get("percent_left"),
++                    # entry-level diagnostics copied onto each keg snapshot for convenience
++                    ATTR_PLAATO_API_VERSION: state.get(ATTR_PLAATO_API_VERSION, "v1"),
++                    ATTR_PLAATO_API_V2: bool(state.get(ATTR_PLAATO_API_V2, False)),
+                 }
+             )
+diff --git a/custom_components/beer_keg_ha/__init__.py b/custom_components/beer_keg_ha/__init__.py
+index 8bd69e8..b1c2c8f 100644
+--- a/custom_components/beer_keg_ha/__init__.py
++++ b/custom_components/beer_keg_ha/__init__.py
+@@ -980,6 +980,198 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+         hass.services.async_register(DOMAIN, "set_display_units", set_display_units)
++
++        # ------------------------------------------------------------
++        # Keg Command API (open-plaato-keg "next")
++        # ------------------------------------------------------------
++        # Documented endpoints:
++        # POST /api/kegs/:id/tare
++        # POST /api/kegs/:id/empty-keg
++        # POST /api/kegs/:id/max-keg-volume
++        # POST /api/kegs/:id/temperature-offset
++        # POST /api/kegs/:id/calibrate-known-weight
++        # POST /api/kegs/:id/beer-style
++        # POST /api/kegs/:id/date
++        # POST /api/kegs/:id/unit
++        # POST /api/kegs/:id/measure-unit
++        # POST /api/kegs/:id/keg-mode
++        # POST /api/kegs/:id/sensitivity
++
++        def _resolve_keg_id(call: ServiceCall) -> str | None:
++            keg_id = call.data.get("id")
++            if keg_id:
++                return str(keg_id)
++            # fallback: use whatever the integration has selected
++            selected = state.get("selected_device")
++            if selected:
++                return str(selected)
++            return None
++
++        async def _post_keg_cmd(keg_id: str, cmd: str, payload: dict | None = None) -> tuple[int, str]:
++            base = _rest_base_from_ws(state["ws_url"])
++            url = f"{base}/api/kegs/{keg_id}/{cmd}"
++            session = async_get_clientsession(hass)
++            async with session.post(url, json=payload or {}) as resp:
++                txt = await resp.text()
++                return resp.status, txt
++
++        async def _handle_cmd_result(keg_id: str, cmd: str, status: int, body: str) -> None:
++            if status == 404:
++                pn_create(
++                    hass,
++                    f"Server does not support Command API (404) for '{cmd}'. "
++                    f"This is expected on older open-plaato-keg servers.",
++                    title="Beer Keg Command",
++                )
++                return
++            if status >= 300:
++                pn_create(
++                    hass,
++                    f"Command '{cmd}' failed for {keg_id}: HTTP {status}\n{body}",
++                    title="Beer Keg Command",
++                )
++                return
++            pn_create(hass, f"Command '{cmd}' sent to {keg_id}", title="Beer Keg Command")
++
++        _SCHEMA_ID_ONLY = vol.Schema({vol.Optional("id"): cv.string})
++        _SCHEMA_FLOAT_VALUE = vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.Coerce(float)})
++        _SCHEMA_INT_VALUE = vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.Coerce(int)})
++        _SCHEMA_STR_VALUE = vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): cv.string})
++
++        async def keg_tare(call: ServiceCall) -> None:
++            keg_id = _resolve_keg_id(call)
++            if not keg_id:
++                pn_create(hass, "No keg selected (provide id or select a device).", title="Beer Keg Command")
++                return
++            status, body = await _post_keg_cmd(keg_id, "tare")
++            await _handle_cmd_result(keg_id, "tare", status, body)
++
++        async def keg_empty_keg(call: ServiceCall) -> None:
++            keg_id = _resolve_keg_id(call)
++            if not keg_id:
++                pn_create(hass, "No keg selected (provide id or select a device).", title="Beer Keg Command")
++                return
++            status, body = await _post_keg_cmd(keg_id, "empty-keg", {"value": float(call.data["value"])})
++            await _handle_cmd_result(keg_id, "empty-keg", status, body)
++
++        async def keg_max_keg_volume(call: ServiceCall) -> None:
++            keg_id = _resolve_keg_id(call)
++            if not keg_id:
++                pn_create(hass, "No keg selected (provide id or select a device).", title="Beer Keg Command")
++                return
++            status, body = await _post_keg_cmd(keg_id, "max-keg-volume", {"value": float(call.data["value"])})
++            await _handle_cmd_result(keg_id, "max-keg-volume", status, body)
++
++        async def keg_temperature_offset(call: ServiceCall) -> None:
++            keg_id = _resolve_keg_id(call)
++            if not keg_id:
++                pn_create(hass, "No keg selected (provide id or select a device).", title="Beer Keg Command")
++                return
++            status, body = await _post_keg_cmd(keg_id, "temperature-offset", {"value": float(call.data["value"])})
++            await _handle_cmd_result(keg_id, "temperature-offset", status, body)
++
++        async def keg_calibrate_known_weight(call: ServiceCall) -> None:
++            keg_id = _resolve_keg_id(call)
++            if not keg_id:
++                pn_create(hass, "No keg selected (provide id or select a device).", title="Beer Keg Command")
++                return
++            status, body = await _post_keg_cmd(keg_id, "calibrate-known-weight", {"value": float(call.data["value"])})
++            await _handle_cmd_result(keg_id, "calibrate-known-weight", status, body)
++
++        async def keg_beer_style(call: ServiceCall) -> None:
++            keg_id = _resolve_keg_id(call)
++            if not keg_id:
++                pn_create(hass, "No keg selected (provide id or select a device).", title="Beer Keg Command")
++                return
++            status, body = await _post_keg_cmd(keg_id, "beer-style", {"value": str(call.data["value"])})
++            await _handle_cmd_result(keg_id, "beer-style", status, body)
++
++        async def keg_date(call: ServiceCall) -> None:
++            keg_id = _resolve_keg_id(call)
++            if not keg_id:
++                pn_create(hass, "No keg selected (provide id or select a device).", title="Beer Keg Command")
++                return
++            status, body = await _post_keg_cmd(keg_id, "date", {"value": str(call.data["value"])})
++            await _handle_cmd_result(keg_id, "date", status, body)
++
++        async def keg_unit_system(call: ServiceCall) -> None:
++            keg_id = _resolve_keg_id(call)
++            if not keg_id:
++                pn_create(hass, "No keg selected (provide id or select a device).", title="Beer Keg Command")
++                return
++            status, body = await _post_keg_cmd(keg_id, "unit", {"value": str(call.data["value"]).lower()})
++            await _handle_cmd_result(keg_id, "unit", status, body)
++
++        async def keg_measure_unit(call: ServiceCall) -> None:
++            keg_id = _resolve_keg_id(call)
++            if not keg_id:
++                pn_create(hass, "No keg selected (provide id or select a device).", title="Beer Keg Command")
++                return
++            status, body = await _post_keg_cmd(keg_id, "measure-unit", {"value": str(call.data["value"]).lower()})
++            await _handle_cmd_result(keg_id, "measure-unit", status, body)
++
++        async def keg_mode(call: ServiceCall) -> None:
++            keg_id = _resolve_keg_id(call)
++            if not keg_id:
++                pn_create(hass, "No keg selected (provide id or select a device).", title="Beer Keg Command")
++                return
++            status, body = await _post_keg_cmd(keg_id, "keg-mode", {"value": str(call.data["value"]).lower()})
++            await _handle_cmd_result(keg_id, "keg-mode", status, body)
++
++        async def keg_sensitivity(call: ServiceCall) -> None:
++            keg_id = _resolve_keg_id(call)
++            if not keg_id:
++                pn_create(hass, "No keg selected (provide id or select a device).", title="Beer Keg Command")
++                return
++            status, body = await _post_keg_cmd(keg_id, "sensitivity", {"value": int(call.data["value"])})
++            await _handle_cmd_result(keg_id, "sensitivity", status, body)
++
++        hass.services.async_register(DOMAIN, "keg_tare", keg_tare, schema=_SCHEMA_ID_ONLY)
++        hass.services.async_register(DOMAIN, "keg_set_empty_keg_weight", keg_empty_keg, schema=_SCHEMA_FLOAT_VALUE)
++        hass.services.async_register(DOMAIN, "keg_set_max_keg_volume", keg_max_keg_volume, schema=_SCHEMA_FLOAT_VALUE)
++        hass.services.async_register(DOMAIN, "keg_set_temperature_offset", keg_temperature_offset, schema=_SCHEMA_FLOAT_VALUE)
++        hass.services.async_register(DOMAIN, "keg_calibrate_known_weight", keg_calibrate_known_weight, schema=_SCHEMA_FLOAT_VALUE)
++        hass.services.async_register(DOMAIN, "keg_set_beer_style", keg_beer_style, schema=_SCHEMA_STR_VALUE)
++        hass.services.async_register(DOMAIN, "keg_set_date", keg_date, schema=_SCHEMA_STR_VALUE)
++        hass.services.async_register(
++            DOMAIN,
++            "keg_set_unit_system",
++            keg_unit_system,
++            schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.In(["metric", "us"])}),
++        )
++        hass.services.async_register(
++            DOMAIN,
++            "keg_set_measure_unit",
++            keg_measure_unit,
++            schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.In(["weight", "volume"])}),
++        )
++        hass.services.async_register(
++            DOMAIN,
++            "keg_set_mode",
++            keg_mode,
++            schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.In(["beer", "co2"])}),
++        )
++        hass.services.async_register(DOMAIN, "keg_set_sensitivity", keg_sensitivity, schema=_SCHEMA_INT_VALUE)
+diff --git a/custom_components/beer_keg_ha/sensor.py b/custom_components/beer_keg_ha/sensor.py
+index 980ae8f..f2a64c3 100644
+--- a/custom_components/beer_keg_ha/sensor.py
++++ b/custom_components/beer_keg_ha/sensor.py
+@@ -1,5 +1,338 @@
+-from __future__ import annotations import logging from datetime import datetime, timezone from typing import Any, Dict, List, Set from homeassistant.components.sensor import SensorEntity from homeassistant.config_entries import ConfigEntry from homeassistant.core import HomeAssistant, callback from homeassistant.helpers.entity import DeviceInfo from homeassistant.helpers.entity_platform import AddEntitiesCallback from .const import DOMAIN _LOGGER = logging.getLogger(__name__) PLATFORM_EVENT = f"{DOMAIN}_update" # ------------------------------------------------------------------- # SENSOR DEFINITIONS # ------------------------------------------------------------------- # "unit" here is the *native* unit our integration stores, # not necessarily what we want to *display*.
+-SENSOR_TYPES: Dict[str, Dict[str, Any]] = { # --- RAW BASE SENSORS (HA-native, fixed units) --- "weight": { "unit": "kg", "name": "Weight", "key": "weight", "icon": "mdi:scale", "device_class": "weight", "state_class": "measurement", }, "temperature": { "unit": "°C", "name": "Temperature", "key": "temperature", "icon": "mdi:thermometer", "device_class": "temperature", "state_class": "measurement", }, # --- DISPLAY SENSORS (follow display_units; no HA auto-conversion) --- "weight_display": { "unit": None, # set dynamically "name": "Weight (Display)", "key": "weight", "icon": "mdi:scale", "device_class": None, # avoid HA unit coercion "state_class": "measurement", }, "temperature_display": { "unit": None, "name": "Temperature (Display)", "key": "temperature", "icon": "mdi:thermometer", "device_class": None, "state_class": "measurement", }, # --- FILL LEVEL --- "fill_percent": { "unit": "%", "name": "Fill Level", "key": "fill_percent", "icon": "mdi:cup", "device_class": None, "state_class": "measurement", }, # legacy alias "fill_level": { "unit": "%", "name": "Fill Level", "key": "fill_percent", "icon": "mdi:cup", "device_class": None, "state_class": "measurement", }, # --- POUR / CONSUMPTION (base = oz) --- "last_pour": { "unit": "oz", "name": "Last Pour (oz)", "key": "last_pour", "icon": "mdi:cup-water", "device_class": None, "state_class": "measurement", }, "daily_consumed": { "unit": "oz", "name": "Daily Consumption (oz)", "key": "daily_consumed", "icon": "mdi:beer", "device_class": None, "state_class": "total_increasing", }, # --- DISPLAY POUR/CONSUMPTION (oz/ml based on display_units.pour) --- "last_pour_display": { "unit": None, # dynamic oz/ml "name": "Last Pour (Display)", "key": "last_pour", "icon": "mdi:cup-water", "device_class": None, "state_class": "measurement", }, "daily_consumption_display": { "unit": None, "name": "Daily Consumption (Display)", "key": "daily_consumed", "icon": "mdi:beer", "device_class": None, "state_class": "total_increasing", }, # --- FULL WEIGHT / META --- "full_weight": { "unit": "kg", "name": "Full Weight", "key": "full_weight", "icon": "mdi:weight", "device_class": "weight", "state_class": "measurement", }, "name": { "unit": None, "name": "Name", "key": "name", "icon": "mdi:barcode", "device_class": None, "state_class": None, }, "id": { "unit": None, "name": "ID", "key": "id", "icon": "mdi:identifier", "device_class": None, "state_class": None, }, } # ------------------------------------------------------------------- # SETUP # ------------------------------------------------------------------- async def async_setup_entry( hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback, ) -> None: """Set up keg sensors for a config entry.""" state = hass.data[DOMAIN][entry.entry_id] created: Set[str] = state.setdefault("created_kegs", set()) entities: List[SensorEntity] = [] # One debug sensor per config entry entities.append(BeerKegDebugSensor(hass, entry)) def create_for(keg_id: str) -> None: """Create all sensors (raw + display) for one keg_id (once).""" if keg_id in created: return ents: List[SensorEntity] = [ KegSensor(hass, entry, keg_id, sensor_key) for sensor_key in SENSOR_TYPES.keys() ] async_add_entities(ents, True) created.add(keg_id) # create for any already-known kegs for keg_id in list(state.get("data", {}).keys()): create_for(keg_id) # add the debug sensor async_add_entities(entities, True) @callback def _on_update(event) -> None: """Handle keg update events from the integration.""" keg_id = (event.data or {}).get("keg_id") if keg_id: create_for(keg_id) # existing sensors for this keg will be nudged by their own listeners entry.async_on_unload(hass.bus.async_listen(PLATFORM_EVENT, _on_update)) # ------------------------------------------------------------------- # PER-KEG SENSOR # ------------------------------------------------------------------- class KegSensor(SensorEntity): """One logical sensor (weight/temp/etc.) for a specific keg.""" _attr_should_poll = False def __init__( self, hass: HomeAssistant, entry: ConfigEntry, keg_id: str, sensor_type: str, ) -> None: self.hass = hass self.entry = entry self.keg_id = keg_id self.sensor_type = sensor_type self._state_ref: Dict[str, Any] = hass.data[DOMAIN][entry.entry_id] self._meta = SENSOR_TYPES[sensor_type] # Shorten keg id in name for cosmetics short_id = keg_id[:4] self._attr_name = f"Keg {short_id} {self._meta['name']}" self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}_{keg_id}_{sensor_type}" self._attr_icon = self._meta.get("icon") self._attr_device_class = self._meta.get("device_class") self._attr_state_class = self._meta.get("state_class") # Start with base unit; display units may adjust this in native_value self._attr_native_unit_of_measurement = self._meta.get("unit") @property def device_info(self) -> DeviceInfo: short_id = self.keg_id[:4] return DeviceInfo( identifiers={(DOMAIN, f"{self.entry.entry_id}_{self.keg_id}")}, name=f"Beer Keg {short_id}", manufacturer="Beer Keg", model="WebSocket + REST", ) # ---- helpers ---- def _get_display_units(self) -> Dict[str, str]: """Return normalized display units dict from integration state.""" du = self._state_ref.get("display_units") or {} weight_u = du.get("weight", "kg") temp_u = du.get("temp", "°C") pour_u = du.get("pour", "oz") if weight_u not in ("kg", "lb"): weight_u = "kg" if temp_u not in ("°C", "°F"): temp_u = "°C" if pour_u not in ("oz", "ml"): pour_u = "oz" return {"weight": weight_u, "temp": temp_u, "pour": pour_u} # ---- core value ---- @property def native_value(self) -> Any: """Return value, converted according to Beer Keg display units.""" data: Dict[str, Dict[str, Any]] = self._state_ref.get("data", {}) raw = data.get(self.keg_id, {}).get(self._meta["key"]) if raw is None: return None units = self._get_display_units() # ========== RAW FIXED-UNIT SENSORS ========== if self.sensor_type == "weight": # Always base kg for HA try: raw_kg = float(raw) except (TypeError, ValueError): return None self._attr_native_unit_of_measurement = "kg" return round(raw_kg, 2) if self.sensor_type == "temperature": # Always base °C for HA try: raw_c = float(raw) except (TypeError, ValueError): return None self._attr_native_unit_of_measurement = "°C" return round(raw_c, 1) # ========== DISPLAY SENSORS (follow display_units) ========== # ---- DISPLAY weight ---- if self.sensor_type == "weight_display": try: raw_kg = float(raw) except (TypeError, ValueError): return None if units["weight"] == "lb": self._attr_native_unit_of_measurement = "lb" return round(raw_kg * 2.20462, 2) else: self._attr_native_unit_of_measurement = "kg" return round(raw_kg, 2) # ---- DISPLAY temperature ---- if self.sensor_type == "temperature_display": try: raw_c = float(raw) except (TypeError, ValueError): return None if units["temp"] == "°F": self._attr_native_unit_of_measurement = "°F" return round((raw_c * 9.0 / 5.0) + 32.0, 1) else: self._attr_native_unit_of_measurement = "°C" return round(raw_c, 1) # ---- DISPLAY pour: last_pour_display ---- if self.sensor_type == "last_pour_display": try: raw_oz = float(raw) except (TypeError, ValueError): return None if units["pour"] == "ml": self._attr_native_unit_of_measurement = "ml" return round(raw_oz * 29.5735, 0) else: self._attr_native_unit_of_measurement = "oz" return round(raw_oz, 1) # ---- DISPLAY pour: daily_consumption_display ---- if self.sensor_type == "daily_consumption_display": try: raw_oz = float(raw) except (TypeError, ValueError): return None if units["pour"] == "ml": self._attr_native_unit_of_measurement = "ml" return round(raw_oz * 29.5735, 0) else: self._attr_native_unit_of_measurement = "oz" return round(raw_oz, 1) # ========== BASE POUR / OTHER META (no dynamic conversion here) ========== if self.sensor_type in ("last_pour", "daily_consumed"): # always stay in oz here; display_* variants handle ml.
+-try: raw_oz = float(raw) except (TypeError, ValueError): return None self._attr_native_unit_of_measurement = "oz" return round(raw_oz, 1) # all remaining fields just return their stored value self._attr_native_unit_of_measurement = self._meta.get("unit") return raw async def async_added_to_hass(self) -> None: """Subscribe to integration update events for this keg.""" self.async_on_remove( self.hass.bus.async_listen(PLATFORM_EVENT, self._refresh_if_mine) ) @callback def _refresh_if_mine(self, event) -> None: """Refresh state when our keg_id gets an update event.""" if (event.data or {}).get("keg_id") == self.keg_id: # Recompute native_value + native_unit_of_measurement self.async_write_ha_state() # ------------------------------------------------------------------- # DEBUG SENSOR # ------------------------------------------------------------------- class BeerKegDebugSensor(SensorEntity): """Diagnostic sensor for Beer Keg integration.""" _attr_should_poll = False def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None: self.hass = hass self.entry = entry self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}_debug" self._attr_name = "Beer Keg Debug" self._attr_icon = "mdi:bug" @property def device_info(self) -> DeviceInfo: """Group under the settings device.""" return DeviceInfo( identifiers={(DOMAIN, f"{self.entry.entry_id}_settings")}, name="Beer Keg Settings", manufacturer="Beer Keg", model="WebSocket + REST", ) @property def native_value(self) -> float | None: """ Show 'seconds since last update' as the main sensor value.
+-None = no update yet.
+-""" state = self.hass.data[DOMAIN][self.entry.entry_id] ts = state.get("last_update_ts") if not isinstance(ts, datetime): return None age = (datetime.now(timezone.utc) - ts).total_seconds() return round(age, 1) @property def extra_state_attributes(self) -> dict: """Expose WS URL, smoothing config, and selected keg smoothing state.""" state = self.hass.data[DOMAIN][self.entry.entry_id] ws_url = state.get("ws_url") noise_deadband = state.get("noise_deadband_kg") smoothing_alpha = state.get("smoothing_alpha") selected = state.get("selected_device") keg_cfg_all: Dict[str, Dict[str, Any]] = state.get("keg_config", {}) or {} keg_cfg = keg_cfg_all.get(selected, {}) if selected else {} kegs_runtime: Dict[str, Any] = state.get("kegs", {}) or {} runtime = kegs_runtime.get(selected, {}) if selected else {} return { "ws_url": ws_url, "noise_deadband_kg": noise_deadband, "smoothing_alpha": smoothing_alpha, "devices": list(state.get("devices", [])), "selected_device": selected, "selected_disable_smoothing": bool( keg_cfg.get("disable_smoothing", False) ), "selected_last_weight_raw": runtime.get("last_weight_raw"), "selected_last_weight_filtered": runtime.get("filtered_weight"), "selected_last_pour_oz": runtime.get("last_pour"), }
++from __future__ import annotations
++
++import logging
++from datetime import datetime, timezone
++from typing import Any, Dict, List, Set
++
++from homeassistant.components.sensor import SensorEntity
++from homeassistant.config_entries import ConfigEntry
++from homeassistant.core import HomeAssistant, callback
++from homeassistant.helpers.entity import DeviceInfo
++from homeassistant.helpers.entity_platform import AddEntitiesCallback
++
++from .const import ATTR_PLAATO_API_V2, ATTR_PLAATO_API_VERSION, DOMAIN
++
++_LOGGER = logging.getLogger(__name__)
++
++PLATFORM_EVENT = f"{DOMAIN}_update"
++
++# -------------------------------------------------------------------
++# SENSOR DEFINITIONS
++# -------------------------------------------------------------------
++# "unit" here is the *native* unit our integration stores,
++# not necessarily what we want to *display*.
++
++SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
++    # --- RAW BASE SENSORS (HA-native, fixed units) ---
++    "weight": {
++        "unit": "kg",
++        "name": "Weight",
++        "key": "weight",
++        "icon": "mdi:scale",
++        "device_class": "weight",
++        "state_class": "measurement",
++    },
++    "temperature": {
++        "unit": "°C",
++        "name": "Temperature",
++        "key": "temperature",
++        "icon": "mdi:thermometer",
++        "device_class": "temperature",
++        "state_class": "measurement",
++    },
++    # --- API v2: liters remaining (native liters) ---
++    "liters_remaining": {
++        "unit": "L",
++        "name": "Liters Remaining",
++        "key": "liters_left",
++        "icon": "mdi:cup",
++        "device_class": "volume",
++        "state_class": "measurement",
++    },
++    # --- DISPLAY SENSORS (follow display_units; no HA auto-conversion) ---
++    "weight_display": {
++        "unit": None,  # set dynamically
++        "name": "Weight (Display)",
++        "key": "weight",
++        "icon": "mdi:scale",
++        "device_class": None,  # avoid HA unit coercion
++        "state_class": "measurement",
++    },
++    "temperature_display": {
++        "unit": None,
++        "name": "Temperature (Display)",
++        "key": "temperature",
++        "icon": "mdi:thermometer",
++        "device_class": None,
++        "state_class": "measurement",
++    },
++    # --- FILL LEVEL ---
++    "fill_percent": {
++        "unit": "%",
++        "name": "Fill Level",
++        "key": "fill_percent",
++        "icon": "mdi:cup",
++        "device_class": None,
++        "state_class": "measurement",
++    },
++    # legacy alias
++    "fill_level": {
++        "unit": "%",
++        "name": "Fill Level",
++        "key": "fill_percent",
++        "icon": "mdi:cup",
++        "device_class": None,
++        "state_class": "measurement",
++    },
++    # --- POUR / CONSUMPTION (base = oz) ---
++    "last_pour": {
++        "unit": "oz",
++        "name": "Last Pour (oz)",
++        "key": "last_pour",
++        "icon": "mdi:cup-water",
++        "device_class": None,
++        "state_class": "measurement",
++    },
++    "daily_consumed": {
++        "unit": "oz",
++        "name": "Daily Consumption (oz)",
++        "key": "daily_consumed",
++        "icon": "mdi:beer",
++        "device_class": None,
++        "state_class": "total_increasing",
++    },
++    # --- DISPLAY POUR/CONSUMPTION (oz/ml based on display_units.pour) ---
++    "last_pour_display": {
++        "unit": None,  # dynamic oz/ml
++        "name": "Last Pour (Display)",
++        "key": "last_pour",
++        "icon": "mdi:cup-water",
++        "device_class": None,
++        "state_class": "measurement",
++    },
++    "daily_consumption_display": {
++        "unit": None,
++        "name": "Daily Consumption (Display)",
++        "key": "daily_consumed",
++        "icon": "mdi:beer",
++        "device_class": None,
++        "state_class": "total_increasing",
++    },
++    # --- FULL WEIGHT / META ---
++    "full_weight": {
++        "unit": "kg",
++        "name": "Full Weight",
++        "key": "full_weight",
++        "icon": "mdi:weight",
++        "device_class": "weight",
++        "state_class": "measurement",
++    },
++    "name": {
++        "unit": None,
++        "name": "Name",
++        "key": "name",
++        "icon": "mdi:barcode",
++        "device_class": None,
++        "state_class": None,
++    },
++    "id": {
++        "unit": None,
++        "name": "ID",
++        "key": "id",
++        "icon": "mdi:identifier",
++        "device_class": None,
++        "state_class": None,
++    },
++}
++
++
++# -------------------------------------------------------------------
++# SETUP
++# -------------------------------------------------------------------
++async def async_setup_entry(
++    hass: HomeAssistant,
++    entry: ConfigEntry,
++    async_add_entities: AddEntitiesCallback,
++) -> None:
++    """Set up keg sensors for a config entry."""
++    state = hass.data[DOMAIN][entry.entry_id]
++    created: Set[str] = state.setdefault("created_kegs", set())
++    entities: List[SensorEntity] = []
++
++    # One debug sensor per config entry
++    entities.append(BeerKegDebugSensor(hass, entry))
++
++    def create_for(keg_id: str) -> None:
++        """Create all sensors (raw + display) for one keg_id (once)."""
++        if keg_id in created:
++            return
++        ents: List[SensorEntity] = [
++            KegSensor(hass, entry, keg_id, sensor_key) for sensor_key in SENSOR_TYPES.keys()
++        ]
++        async_add_entities(ents, True)
++        created.add(keg_id)
++
++    # create for any already-known kegs
++    for keg_id in list(state.get("data", {}).keys()):
++        create_for(keg_id)
++
++    # add the debug sensor
++    async_add_entities(entities, True)
++
++    @callback
++    def _on_update(event) -> None:
++        """Handle keg update events from the integration."""
++        keg_id = (event.data or {}).get("keg_id")
++        if keg_id:
++            create_for(keg_id)
++
++    entry.async_on_unload(hass.bus.async_listen(PLATFORM_EVENT, _on_update))
++
++
++# -------------------------------------------------------------------
++# PER-KEG SENSOR
++# -------------------------------------------------------------------
++class KegSensor(SensorEntity):
++    """One logical sensor (weight/temp/etc.) for a specific keg."""
++
++    _attr_should_poll = False
++
++    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, keg_id: str, sensor_type: str) -> None:
++        self.hass = hass
++        self.entry = entry
++        self.keg_id = keg_id
++        self.sensor_type = sensor_type
++        self._state_ref: Dict[str, Any] = hass.data[DOMAIN][entry.entry_id]
++        self._meta = SENSOR_TYPES[sensor_type]
++
++        short_id = keg_id[:4]
++        self._attr_name = f"Keg {short_id} {self._meta['name']}"
++        self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}_{keg_id}_{sensor_type}"
++        self._attr_icon = self._meta.get("icon")
++        self._attr_device_class = self._meta.get("device_class")
++        self._attr_state_class = self._meta.get("state_class")
++        self._attr_native_unit_of_measurement = self._meta.get("unit")
++
++    @property
++    def device_info(self) -> DeviceInfo:
++        short_id = self.keg_id[:4]
++        return DeviceInfo(
++            identifiers={(DOMAIN, f"{self.entry.entry_id}_{self.keg_id}")},
++            name=f"Beer Keg {short_id}",
++            manufacturer="Beer Keg",
++            model="WebSocket + REST",
++        )
++
++    def _get_display_units(self) -> Dict[str, str]:
++        du = self._state_ref.get("display_units") or {}
++        weight_u = du.get("weight", "kg")
++        temp_u = du.get("temp", "°C")
++        pour_u = du.get("pour", "oz")
++        if weight_u not in ("kg", "lb"):
++            weight_u = "kg"
++        if temp_u not in ("°C", "°F"):
++            temp_u = "°C"
++        if pour_u not in ("oz", "ml"):
++            pour_u = "oz"
++        return {"weight": weight_u, "temp": temp_u, "pour": pour_u}
++
++    @property
++    def native_value(self) -> Any:
++        data: Dict[str, Dict[str, Any]] = self._state_ref.get("data", {})
++        raw = data.get(self.keg_id, {}).get(self._meta["key"])
++        if raw is None:
++            return None
++
++        units = self._get_display_units()
++
++        # Fixed-unit sensors
++        if self.sensor_type == "weight":
++            try:
++                raw_kg = float(raw)
++            except (TypeError, ValueError):
++                return None
++            self._attr_native_unit_of_measurement = "kg"
++            return round(raw_kg, 2)
++
++        if self.sensor_type == "temperature":
++            try:
++                raw_c = float(raw)
++            except (TypeError, ValueError):
++                return None
++            self._attr_native_unit_of_measurement = "°C"
++            return round(raw_c, 1)
++
++        if self.sensor_type == "liters_remaining":
++            # Native liters from API v2; will be None on v1 servers
++            try:
++                raw_l = float(raw)
++            except (TypeError, ValueError):
++                return None
++            self._attr_native_unit_of_measurement = "L"
++            return round(raw_l, 3)
++
++        # Display sensors (manual conversion)
++        if self.sensor_type == "weight_display":
++            try:
++                raw_kg = float(raw)
++            except (TypeError, ValueError):
++                return None
++            if units["weight"] == "lb":
++                self._attr_native_unit_of_measurement = "lb"
++                return round(raw_kg * 2.20462, 2)
++            self._attr_native_unit_of_measurement = "kg"
++            return round(raw_kg, 2)
++
++        if self.sensor_type == "temperature_display":
++            try:
++                raw_c = float(raw)
++            except (TypeError, ValueError):
++                return None
++            if units["temp"] == "°F":
++                self._attr_native_unit_of_measurement = "°F"
++                return round((raw_c * 9.0 / 5.0) + 32.0, 1)
++            self._attr_native_unit_of_measurement = "°C"
++            return round(raw_c, 1)
++
++        if self.sensor_type == "last_pour_display":
++            try:
++                raw_oz = float(raw)
++            except (TypeError, ValueError):
++                return None
++            if units["pour"] == "ml":
++                self._attr_native_unit_of_measurement = "ml"
++                return round(raw_oz * 29.5735, 0)
++            self._attr_native_unit_of_measurement = "oz"
++            return round(raw_oz, 1)
++
++        if self.sensor_type == "daily_consumption_display":
++            try:
++                raw_oz = float(raw)
++            except (TypeError, ValueError):
++                return None
++            if units["pour"] == "ml":
++                self._attr_native_unit_of_measurement = "ml"
++                return round(raw_oz * 29.5735, 0)
++            self._attr_native_unit_of_measurement = "oz"
++            return round(raw_oz, 1)
++
++        if self.sensor_type in ("last_pour", "daily_consumed"):
++            try:
++                raw_oz = float(raw)
++            except (TypeError, ValueError):
++                return None
++            self._attr_native_unit_of_measurement = "oz"
++            return round(raw_oz, 1)
++
++        self._attr_native_unit_of_measurement = self._meta.get("unit")
++        return raw
++
++    async def async_added_to_hass(self) -> None:
++        self.async_on_remove(self.hass.bus.async_listen(PLATFORM_EVENT, self._refresh_if_mine))
++
++    @callback
++    def _refresh_if_mine(self, event) -> None:
++        if (event.data or {}).get("keg_id") == self.keg_id:
++            self.async_write_ha_state()
++
++
++# -------------------------------------------------------------------
++# DEBUG SENSOR
++# -------------------------------------------------------------------
++class BeerKegDebugSensor(SensorEntity):
++    """Diagnostic sensor for Beer Keg integration."""
++
++    _attr_should_poll = False
++
++    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
++        self.hass = hass
++        self.entry = entry
++        self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}_debug"
++        self._attr_name = "Beer Keg Debug"
++        self._attr_icon = "mdi:bug"
++
++    @property
++    def device_info(self) -> DeviceInfo:
++        return DeviceInfo(
++            identifiers={(DOMAIN, f"{self.entry.entry_id}_settings")},
++            name="Beer Keg Settings",
++            manufacturer="Beer Keg",
++            model="WebSocket + REST",
++        )
++
++    @property
++    def native_value(self) -> float | None:
++        """Seconds since last update. None = no update yet."""
++        state = self.hass.data[DOMAIN][self.entry.entry_id]
++        ts = state.get("last_update_ts")
++        if not isinstance(ts, datetime):
++            return None
++        age = (datetime.now(timezone.utc) - ts).total_seconds()
++        return round(age, 1)
++
++    @property
++    def extra_state_attributes(self) -> dict:
++        """Expose WS URL, smoothing config, and API capability flags."""
++        state = self.hass.data[DOMAIN][self.entry.entry_id]
++        ws_url = state.get("ws_url")
++        noise_deadband = state.get("noise_deadband_kg")
++        smoothing_alpha = state.get("smoothing_alpha")
++        selected = state.get("selected_device")
++
++        keg_cfg_all: Dict[str, Dict[str, Any]] = state.get("keg_config", {}) or {}
++        keg_cfg = keg_cfg_all.get(selected, {}) if selected else {}
++
++        kegs_runtime: Dict[str, Any] = state.get("kegs", {}) or {}
++        runtime = kegs_runtime.get(selected, {}) if selected else {}
++
++        return {
++            "ws_url": ws_url,
++            "noise_deadband_kg": noise_deadband,
++            "smoothing_alpha": smoothing_alpha,
++            "devices": list(state.get("devices", [])),
++            "selected_device": selected,
++            "selected_disable_smoothing": bool(keg_cfg.get("disable_smoothing", False)),
++            "selected_last_weight_raw": runtime.get("last_weight_raw"),
++            "selected_last_weight_filtered": runtime.get("filtered_weight"),
++            "selected_last_pour_oz": runtime.get("last_pour"),
++            # NEW: capability flags
++            ATTR_PLAATO_API_VERSION: state.get(ATTR_PLAATO_API_VERSION, "v1"),
++            ATTR_PLAATO_API_V2: bool(state.get(ATTR_PLAATO_API_V2, False)),
++        }
+diff --git a/custom_components/beer_keg_ha/services.yaml b/custom_components/beer_keg_ha/services.yaml
+index 2a6d3c1..4d2ac0d 100644
+--- a/custom_components/beer_keg_ha/services.yaml
++++ b/custom_components/beer_keg_ha/services.yaml
+@@ -1 +1,170 @@
+-export_history: name: Export History description: Write pour history to /config/www/beer_keg_history.json (served at /local/beer_keg_history.json) refresh_kegs: name: Refresh Kegs (REST) description: Pull the latest keg data from the REST API and update sensors republish_all: name: Republish All description: Re-fire update events for all known kegs (useful to refresh dashboards) refresh_devices: name: Refresh Device List description: Query /api/kegs/devices to update the device selector (select.beer_keg_devices) calibrate_keg: name: Calibrate Keg description: Send calibration payload to /api/kegs/calibrate fields: id: name: Keg ID description: Target keg id (e.g., from select.beer_keg_devices) required: true example: "00000000000000000000000000000001" selector: text: name: name: Name required: true selector: text: full_weight: name: Full weight (kg) required: true selector: number: min: 0 step: 0.01 weight_calibrate: name: Weight calibrate (kg) required: true selector: number: min: -10 max: 10 step: 0.01 temperature_calibrate: name: Temperature calibrate (°C) required: true selector: number: min: -10 max: 10 step: 0.1 set_display_units: name: Set Display Units description: Update dashboard display units for weight and temperature fields: weight_unit: name: Weight unit required: true selector: select: options: [kg, lb] temp_unit: name: Temperature unit required: true selector: select: options: ["°C", "°F"]
++export_history:
++  name: Export History
++  description: Write pour history to /config/www/beer_keg_history.json (served at /local/beer_keg_history.json)
++
++refresh_kegs:
++  name: Refresh Kegs (REST)
++  description: Pull the latest keg data from the REST API and update sensors
++
++republish_all:
++  name: Republish All
++  description: Re-fire update events for all known kegs (useful to refresh dashboards)
++
++refresh_devices:
++  name: Refresh Device List
++  description: Query /api/kegs/devices to update the device selector (select.beer_keg_devices)
++
++calibrate_keg:
++  name: Calibrate Keg
++  description: Send calibration payload to /api/kegs/calibrate
++  fields:
++    id:
++      name: Keg ID
++      description: Target keg id (e.g., from select.beer_keg_devices)
++      required: true
++      example: "00000000000000000000000000000001"
++      selector:
++        text:
++    name:
++      name: Name
++      required: true
++      selector:
++        text:
++    full_weight:
++      name: Full weight (kg)
++      required: true
++      selector:
++        number:
++          min: 0
++          step: 0.01
++    weight_calibrate:
++      name: Weight calibrate (kg)
++      required: true
++      selector:
++        number:
++          min: -10
++          max: 10
++          step: 0.01
++    temperature_calibrate:
++      name: Temperature calibrate (°C)
++      required: true
++      selector:
++        number:
++          min: -10
++          max: 10
++          step: 0.1
++
++set_display_units:
++  name: Set Display Units
++  description: Update dashboard display units for weight and temperature
++  fields:
++    weight_unit:
++      name: Weight unit
++      required: true
++      selector:
++        select:
++          options: [kg, lb]
++    temp_unit:
++      name: Temperature unit
++      required: true
++      selector:
++        select:
++          options: ["°C", "°F"]
++
++# ------------------------------------------------------------
++# Keg Command API (open-plaato-keg "next")
++# If you omit `id`, the integration will use the currently selected device.
++
++keg_tare:
++  name: Tare Scale
++  description: "POST /api/kegs/:id/tare"
++  fields:
++    id:
++      name: Keg ID
++      required: false
++      selector:
++        text:
++
++keg_set_empty_keg_weight:
++  name: Set Empty Keg Weight
++  description: "POST /api/kegs/:id/empty-keg"
++  fields:
++    id:
++      name: Keg ID
++      required: false
++      selector:
++        text:
++    value:
++      name: Empty keg weight (kg)
++      required: true
++      selector:
++        number:
++          min: 0
++          max: 50
++          step: 0.01
++
++keg_set_max_keg_volume:
++  name: Set Max Keg Volume
++  description: "POST /api/kegs/:id/max-keg-volume"
++  fields:
++    id:
++      name: Keg ID
++      required: false
++      selector:
++        text:
++    value:
++      name: Max keg volume (liters)
++      required: true
++      selector:
++        number:
++          min: 0
++          max: 100
++          step: 0.01
++
++keg_set_temperature_offset:
++  name: Set Temperature Offset
++  description: "POST /api/kegs/:id/temperature-offset"
++  fields:
++    id:
++      name: Keg ID
++      required: false
++      selector:
++        text:
++    value:
++      name: Temperature offset (°C)
++      required: true
++      selector:
++        number:
++          min: -20
++          max: 20
++          step: 0.1
++
++keg_calibrate_known_weight:
++  name: Calibrate With Known Weight
++  description: "POST /api/kegs/:id/calibrate-known-weight"
++  fields:
++    id:
++      name: Keg ID
++      required: false
++      selector:
++        text:
++    value:
++      name: Known weight (kg)
++      required: true
++      selector:
++        number:
++          min: 0
++          max: 100
++          step: 0.01
++
++keg_set_beer_style:
++  name: Set Beer Style
++  description: "POST /api/kegs/:id/beer-style"
++  fields:
++    id:
++      name: Keg ID
++      required: false
++      selector:
++        text:
++    value:
++      name: Beer style
++      required: true
++      selector:
++        text:
++
++keg_set_date:
++  name: Set Keg Date
++  description: "POST /api/kegs/:id/date"
++  fields:
++    id:
++      name: Keg ID
++      required: false
++      selector:
++        text:
++    value:
++      name: Date string
++      description: Recommended YYYY-MM-DD
++      required: true
++      selector:
++        text:
++
++keg_set_unit_system:
++  name: Set Unit System
++  description: "POST /api/kegs/:id/unit"
++  fields:
++    id:
++      name: Keg ID
++      required: false
++      selector:
++        text:
++    value:
++      name: Unit system
++      required: true
++      selector:
++        select:
++          options: [metric, us]
++
++keg_set_measure_unit:
++  name: Set Measure Mode
++  description: "POST /api/kegs/:id/measure-unit"
++  fields:
++    id:
++      name: Keg ID
++      required: false
++      selector:
++        text:
++    value:
++      name: Measure mode
++      required: true
++      selector:
++        select:
++          options: [weight, volume]
++
++keg_set_mode:
++  name: Set Keg Mode
++  description: "POST /api/kegs/:id/keg-mode"
++  fields:
++    id:
++      name: Keg ID
++      required: false
++      selector:
++        text:
++    value:
++      name: Keg mode
++      required: true
++      selector:
++        select:
++          options: [beer, co2]
++
++keg_set_sensitivity:
++  name: Set Sensitivity
++  description: "POST /api/kegs/:id/sensitivity"
++  fields:
++    id:
++      name: Keg ID
++      required: false
++      selector:
++        text:
++    value:
++      name: Sensitivity level
++      required: true
++      selector:
++        number:
++          min: 0
++          max: 10
++          step: 1
