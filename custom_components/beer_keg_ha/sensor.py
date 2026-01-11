@@ -26,6 +26,14 @@ SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
         "device_class": "weight",
         "state_class": "measurement",
     },
+    "beer_weight": {
+        "unit": "kg",
+        "name": "Beer Weight",
+        "key": "beer_weight",
+        "icon": "mdi:beer",
+        "device_class": "weight",
+        "state_class": "measurement",
+    },   
     "temperature": {
         "unit": "°C",
         "name": "Temperature",
@@ -179,8 +187,14 @@ class KegSensor(SensorEntity):
                 return round(float(raw), 3)
             except Exception:
                 return None
+        if self.sensor_type == "beer_weight":
+            try:
+                return round(float(raw), 2)
+            except Exception:
+                return None
 
         return raw
+        
 
     async def async_added_to_hass(self) -> None:
         self.async_on_remove(self.hass.bus.async_listen(PLATFORM_EVENT, self._refresh_if_mine))
