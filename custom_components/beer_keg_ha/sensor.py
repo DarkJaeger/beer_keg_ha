@@ -10,14 +10,21 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, PLATFORM_EVENT, ATTR_LAST_UPDATE
+from .const import (
+    DOMAIN,
+    PLATFORM_EVENT,
+    ATTR_LAST_UPDATE,
+    ATTR_KEGGED_DATE,
+    ATTR_EXPIRATION_DATE,
+    ATTR_DAYS_UNTIL_EXPIRATION,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 # v2-only sensors: raw + derived
 SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
     # -------------------------
-    # Derived (computed)
+    # Computed (derived)
     # -------------------------
     "total_weight_kg": {
         "name": "Total Weight",
@@ -45,6 +52,55 @@ SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
         "state_class": None,  # remaining is a level
         "unit": "L",
         "round": 3,
+    },
+
+    # NEW: computed pour stats (from __init__.py)
+    "last_pour_oz": {
+        "name": "Last Pour",
+        "key": "last_pour_oz",
+        "icon": "mdi:cup-water",
+        "device_class": None,
+        "state_class": "measurement",
+        "unit": "oz",
+        "round": 1,
+    },
+    "daily_consumption_oz": {
+        "name": "Daily Consumption",
+        "key": "daily_consumption_oz",
+        "icon": "mdi:beer",
+        "device_class": None,
+        "state_class": "measurement",
+        "unit": "oz",
+        "round": 1,
+    },
+
+    # NEW: manual meta dates (strings) + derived days-until
+    "kegged_date": {
+        "name": "Kegged Date",
+        "key": ATTR_KEGGED_DATE,
+        "icon": "mdi:calendar-start",
+        "device_class": None,
+        "state_class": None,
+        "unit": None,
+        "round": None,
+    },
+    "expiration_date": {
+        "name": "Expiration Date",
+        "key": ATTR_EXPIRATION_DATE,
+        "icon": "mdi:calendar-end",
+        "device_class": None,
+        "state_class": None,
+        "unit": None,
+        "round": None,
+    },
+    "days_until_expiration": {
+        "name": "Days Until Expiration",
+        "key": ATTR_DAYS_UNTIL_EXPIRATION,
+        "icon": "mdi:timer-sand",
+        "device_class": None,
+        "state_class": "measurement",
+        "unit": "d",
+        "round": None,
     },
 
     # -------------------------
@@ -128,7 +184,6 @@ SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
         "round": 3,
     },
 
-    # WiFi strength on this server is a percent (0-100) not dBm; keep as plain numeric
     "wifi_signal_strength": {
         "name": "WiFi Signal",
         "key": "wifi_signal_strength",
@@ -139,7 +194,6 @@ SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
         "round": None,
     },
 
-    # Booleans/flags (keep as simple sensors: no device_class/state_class)
     "leak_detection": {
         "name": "Leak Detection",
         "key": "leak_detection",
@@ -159,7 +213,6 @@ SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
         "round": None,
     },
 
-    # Pour info
     "last_pour": {
         "name": "Last Pour (Raw)",
         "key": "last_pour",
@@ -179,36 +232,30 @@ SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
         "round": None,
     },
 
-    # Volume config
     "max_keg_volume": {
         "name": "Max Keg Volume",
         "key": "max_keg_volume",
         "icon": "mdi:keg",
         "device_class": "volume",
-        "state_class": None,  # not an accumulating counter
+        "state_class": None,
         "unit": "L",
         "round": 3,
     },
 
-    # Misc numeric settings
     "measure_unit": {"name": "Measure Unit", "key": "measure_unit", "icon": "mdi:tune", "device_class": None, "state_class": None, "unit": None, "round": None},
     "unit": {"name": "Unit System", "key": "unit", "icon": "mdi:ruler", "device_class": None, "state_class": None, "unit": None, "round": None},
 
-    # Units as strings
     "volume_unit": {"name": "Volume Unit", "key": "volume_unit", "icon": "mdi:format-letter-case", "device_class": None, "state_class": None, "unit": None, "round": None},
     "beer_left_unit": {"name": "Beer Left Unit", "key": "beer_left_unit", "icon": "mdi:format-letter-case", "device_class": None, "state_class": None, "unit": None, "round": None},
     "temperature_unit": {"name": "Temperature Unit", "key": "temperature_unit", "icon": "mdi:format-letter-case", "device_class": None, "state_class": None, "unit": None, "round": None},
 
-    # Firmware / strings
     "firmware_version": {"name": "Firmware Version", "key": "firmware_version", "icon": "mdi:identifier", "device_class": None, "state_class": None, "unit": None, "round": None},
     "keg_temperature_string": {"name": "Temperature (String)", "key": "keg_temperature_string", "icon": "mdi:thermometer", "device_class": None, "state_class": None, "unit": None, "round": None},
     "chip_temperature_string": {"name": "Chip Temp (String)", "key": "chip_temperature_string", "icon": "mdi:chip", "device_class": None, "state_class": None, "unit": None, "round": None},
 
-    # Gravity
     "og": {"name": "OG", "key": "og", "icon": "mdi:alpha-o-circle", "device_class": None, "state_class": None, "unit": None, "round": None},
     "fg": {"name": "FG", "key": "fg", "icon": "mdi:alpha-f-circle", "device_class": None, "state_class": None, "unit": None, "round": None},
 
-    # ---- Internal flattened fields (require __init__.py normalize to output these keys) ----
     "internal_ver": {"name": "Internal Version", "key": "internal_ver", "icon": "mdi:information", "device_class": None, "state_class": None, "unit": None, "round": None},
     "internal_fw": {"name": "Internal FW", "key": "internal_fw", "icon": "mdi:information", "device_class": None, "state_class": None, "unit": None, "round": None},
     "internal_dev": {"name": "Internal Device", "key": "internal_dev", "icon": "mdi:chip", "device_class": None, "state_class": None, "unit": None, "round": None},

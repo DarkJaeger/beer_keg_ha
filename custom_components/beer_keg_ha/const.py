@@ -34,3 +34,14 @@ DEVICES_UPDATE_EVENT = f"{DOMAIN}_devices_update"
 
 # --- Runtime state keys ---
 ATTR_LAST_UPDATE = "last_update_ts"
+
+# --- Manual dates (stored per-keg, set via services) ---
+# Stored as strings in MM/DD/YYYY
+ATTR_KEGGED_DATE = "kegged_date"
+ATTR_EXPIRATION_DATE = "expiration_date"
+
+# --- Derived sensor keys ---
+ATTR_DAYS_UNTIL_EXPIRATION = "days_until_expiration"
+
+# --- Date format for UI/services ---
+DATE_FORMAT = "%m/%d/%Y"
