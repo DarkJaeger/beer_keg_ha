@@ -21,7 +21,6 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# v2-only sensors: raw + derived
 SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
     # -------------------------
     # Computed (derived)
@@ -36,7 +35,7 @@ SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
         "round": 3,
     },
     "beer_remaining_kg": {
-        "name": "Beer Remaining",
+        "name": "Beer Remaining (kg)",
         "key": "beer_remaining_kg",
         "icon": "mdi:beer",
         "device_class": "weight",
@@ -45,7 +44,7 @@ SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
         "round": 3,
     },
     "liters_remaining": {
-        "name": "Beer Remaining",
+        "name": "Beer Remaining (L)",
         "key": "liters_remaining",
         "icon": "mdi:cup",
         "device_class": "volume",
@@ -54,9 +53,9 @@ SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
         "round": 3,
     },
 
-    # NEW: computed pour stats (from __init__.py)
+    # computed pour stats (from __init__.py)
     "last_pour_oz": {
-        "name": "Last Pour",
+        "name": "Last Pour (oz)",
         "key": "last_pour_oz",
         "icon": "mdi:cup-water",
         "device_class": None,
@@ -65,16 +64,16 @@ SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
         "round": 1,
     },
     "daily_consumption_oz": {
-        "name": "Daily Consumption",
+        "name": "Daily Consumption (oz)",
         "key": "daily_consumption_oz",
         "icon": "mdi:beer",
         "device_class": None,
-        "state_class": "measurement",
+        "state_class": "measurement",  # resets daily; do NOT use total_increasing
         "unit": "oz",
         "round": 1,
     },
 
-    # NEW: manual meta dates (strings) + derived days-until
+    # manual meta dates (strings) + derived days-until
     "kegged_date": {
         "name": "Kegged Date",
         "key": ATTR_KEGGED_DATE,

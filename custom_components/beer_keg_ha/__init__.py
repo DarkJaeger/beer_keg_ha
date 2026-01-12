@@ -4,19 +4,19 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 import voluptuous as vol
-
+from homeassistant.components.persistent_notification import async_create as pn_create
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
-from homeassistant.helpers import config_validation as cv
-from homeassistant.util import dt as dt_util
 
 from .const import (
     DOMAIN,
@@ -24,7 +24,6 @@ from .const import (
     PLATFORM_EVENT,
     DEVICES_UPDATE_EVENT,
     ATTR_LAST_UPDATE,
-    # date/meta keys
     ATTR_KEGGED_DATE,
     ATTR_EXPIRATION_DATE,
     ATTR_DAYS_UNTIL_EXPIRATION,
@@ -39,11 +38,10 @@ REST_POLL_SECONDS = 10
 DEVICES_REFRESH_SEC = 60
 WS_RECONNECT_DELAY = 5
 
-# Used only when server reports beer_left_unit == liters
+KG_TO_OZ = 35.274
+
 DEFAULT_BEER_SG = 1.010
 WATER_DENSITY_KG_PER_L = 0.998
-
-KG_TO_OZ = 35.274  # for computed daily consumption / pours
 
 
 def _rest_base_from_ws(ws: str) -> str:
@@ -75,15 +73,23 @@ def _parse_temp_from_string(s: str | None) -> float | None:
         return None
 
 
-def _parse_mmddyyyy(s: str | None) -> datetime | None:
-    """Parse MM/DD/YYYY into a datetime (local tz, midnight)."""
-    if not s:
+def _parse_mmddyyyy(s: Any) -> Optional[datetime]:
+    """Parse MM/DD/YYYY -> aware UTC datetime at 00:00:00."""
+    if not isinstance(s, str) or not s.strip():
         return None
     try:
-        d = datetime.strptime(s.strip(), DATE_FORMAT).date()
-        return dt_util.start_of_local_day(datetime.combine(d, datetime.min.time()))
+        dt = datetime.strptime(s.strip(), DATE_FORMAT)
+        return dt.replace(tzinfo=timezone.utc)
     except Exception:
         return None
+
+
+def _days_until(exp: Any) -> Optional[int]:
+    dt = _parse_mmddyyyy(exp)
+    if not dt:
+        return None
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    return int((dt - today).days)
 
 
 def _normalize_v2(keg: dict) -> dict:
@@ -107,7 +113,6 @@ def _normalize_v2(keg: dict) -> dict:
     if percent_left is not None:
         percent_left = max(0.0, min(100.0, percent_left))
 
-    # temps
     keg_temp = _coerce_float(keg.get("keg_temperature"))
     chip_temp = _parse_temp_from_string(str(keg.get("chip_temperature_string") or ""))
 
@@ -126,7 +131,6 @@ def _normalize_v2(keg: dict) -> dict:
     liters_remaining: float | None = None
     beer_remaining_kg: float | None = None
 
-    # amount_left meaning depends on beer_left_unit
     if amount_left is not None:
         if beer_left_unit in ("kg", "kilogram", "kilograms"):
             beer_remaining_kg = amount_left
@@ -134,7 +138,7 @@ def _normalize_v2(keg: dict) -> dict:
             liters_remaining = amount_left
             beer_remaining_kg = liters_remaining * DEFAULT_BEER_SG * WATER_DENSITY_KG_PER_L
 
-    # If server reports kg, derive liters too (approx) using SG*density
+    # If server reports kg, derive liters too (approx)
     if beer_remaining_kg is not None and liters_remaining is None:
         liters_remaining = beer_remaining_kg / (DEFAULT_BEER_SG * WATER_DENSITY_KG_PER_L)
 
@@ -146,7 +150,7 @@ def _normalize_v2(keg: dict) -> dict:
         "id": keg_id,
         "short_id": short_id,
 
-        # raw fields (as sensors)
+        # raw fields
         "firmware_version": keg.get("firmware_version"),
         "chip_temperature_string": keg.get("chip_temperature_string"),
         "max_temperature": _coerce_float(keg.get("max_temperature")),
@@ -170,7 +174,7 @@ def _normalize_v2(keg: dict) -> dict:
         "amount_left": amount_left,
         "unit": _coerce_int(keg.get("unit")),
 
-        # flattened internal fields (for sensors)
+        # internal flattened
         "internal_ver": internal_ver,
         "internal_fw": internal_fw,
         "internal_dev": internal_dev,
@@ -193,6 +197,12 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     return True
 
 
+def _register_service_once(hass: HomeAssistant, name: str, handler, schema=None) -> None:
+    if hass.services.has_service(DOMAIN, name):
+        return
+    hass.services.async_register(DOMAIN, name, handler, schema=schema)
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     ws_url: str | None = entry.data.get(CONF_WS_URL)
     if not ws_url:
@@ -200,80 +210,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         return False
 
     hass.data.setdefault(DOMAIN, {})
-
-    # stores manual meta: kegged/expiration dates
-    meta_store: Store = Store(hass, 1, f"{DOMAIN}_meta")
-    loaded_meta = await meta_store.async_load()
-    if not isinstance(loaded_meta, dict):
-        loaded_meta = {}
-
     state: Dict[str, Any] = {
         "ws_url": ws_url,
-        "data": {},      # normalized per-keg values used by entities
-        "raw": {},       # raw payload per keg (optional)
+        "data": {},
+        "raw": {},
         "devices": [],
-        "connected": [],  # from /api/kegs/connected if available
-
-        "meta": loaded_meta,   # { keg_id: {kegged_date, expiration_date} }
-        "meta_store": meta_store,
-
-        # computed daily stats (runtime)
-        "stats": {},     # { keg_id: {last_weight, daily_oz, day_key, last_pour_oz} }
-
+        "selected_device": None,  # used by your single manual select
         ATTR_LAST_UPDATE: None,
+
+        # computed pour stats (per keg)
+        "pour": {},
+
+        # manual per-keg meta (persisted)
+        "meta": {},
+        "meta_store": Store(hass, 1, f"{DOMAIN}_meta_{entry.entry_id}"),
     }
     hass.data[DOMAIN][entry.entry_id] = state
 
     base = _rest_base_from_ws(ws_url)
     session = async_get_clientsession(hass)
 
-    def _compute_days_until_expiration(exp_str: str | None) -> int | None:
-        exp_dt = _parse_mmddyyyy(exp_str)
-        if exp_dt is None:
-            return None
-        today = dt_util.now().date()
-        exp_date = exp_dt.date()
-        return (exp_date - today).days
-
-    def _apply_meta_and_stats(keg_id: str, norm: dict) -> dict:
-        """Merge manual meta + computed stats into the normalized dict."""
-        meta = (state.get("meta") or {}).get(keg_id) or {}
-        kegged_date = meta.get(ATTR_KEGGED_DATE)
-        expiration_date = meta.get(ATTR_EXPIRATION_DATE)
-
-        days = _compute_days_until_expiration(expiration_date)
-
-        stats = state.setdefault("stats", {}).setdefault(
-            keg_id,
-            {"last_weight": None, "daily_oz": 0.0, "day_key": None, "last_pour_oz": 0.0},
-        )
-
-        today_key = dt_util.now().date().isoformat()
-        if stats.get("day_key") != today_key:
-            stats["day_key"] = today_key
-            stats["daily_oz"] = 0.0
-            stats["last_pour_oz"] = 0.0
-
-        w = norm.get("total_weight_kg")
-        if isinstance(w, (int, float)):
-            prev = stats.get("last_weight")
-            if isinstance(prev, (int, float)):
-                delta_kg = float(prev) - float(w)
-                if delta_kg > 0.01:
-                    last_pour_oz = round(delta_kg * KG_TO_OZ, 1)
-                    stats["last_pour_oz"] = last_pour_oz
-                    stats["daily_oz"] = round(float(stats.get("daily_oz", 0.0)) + last_pour_oz, 1)
-                else:
-                    stats["last_pour_oz"] = 0.0
-            stats["last_weight"] = float(w)
-
-        norm[ATTR_KEGGED_DATE] = kegged_date
-        norm[ATTR_EXPIRATION_DATE] = expiration_date
-        norm[ATTR_DAYS_UNTIL_EXPIRATION] = days
-        norm["daily_consumption_oz"] = stats.get("daily_oz", 0.0)
-        norm["last_pour_oz"] = stats.get("last_pour_oz", 0.0)
-
-        return norm
+    # ---- load persisted meta
+    try:
+        loaded = await state["meta_store"].async_load()
+        if isinstance(loaded, dict):
+            state["meta"] = loaded
+    except Exception as e:
+        _LOGGER.debug("%s: meta load failed: %s", DOMAIN, e)
 
     async def fetch_devices() -> List[str]:
         url = f"{base}/api/kegs/devices"
@@ -291,24 +254,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             pass
         return state.get("devices", [])
 
-    async def fetch_connected() -> List[str]:
-        """GET /api/kegs/connected -> list of currently connected kegs."""
-        url = f"{base}/api/kegs/connected"
-        try:
-            async with session.get(url) as resp:
-                if resp.status == 404:
-                    return state.get("connected", [])
-                if resp.status != 200:
-                    return state.get("connected", [])
-                data = await resp.json()
-                if isinstance(data, list):
-                    ids = [str(x) for x in data]
-                    state["connected"] = ids
-                    return ids
-        except Exception:
-            pass
-        return state.get("connected", [])
-
     async def fetch_kegs_rest() -> List[dict]:
         url = f"{base}/api/kegs"
         async with session.get(url) as resp:
@@ -320,13 +265,64 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 raise RuntimeError("Expected list from /api/kegs")
             return data
 
+    def _update_pour_stats(keg_id: str, norm: dict) -> None:
+        """Compute last_pour_oz + daily_consumption_oz from drop in total_weight_kg."""
+        total_kg = norm.get("total_weight_kg")
+        if not isinstance(total_kg, (int, float)):
+            norm["last_pour_oz"] = None
+            norm["daily_consumption_oz"] = None
+            return
+
+        today = datetime.now(timezone.utc).date().isoformat()
+        p = state["pour"].get(keg_id)
+
+        if not p:
+            p = state["pour"][keg_id] = {
+                "last_total_kg": float(total_kg),
+                "last_pour_oz": 0.0,
+                "daily_oz": 0.0,
+                "day": today,
+            }
+            norm["last_pour_oz"] = 0.0
+            norm["daily_consumption_oz"] = 0.0
+            return
+
+        if p.get("day") != today:
+            p["day"] = today
+            p["daily_oz"] = 0.0
+
+        prev = float(p.get("last_total_kg") or total_kg)
+        curr = float(total_kg)
+        delta_kg = prev - curr  # positive means poured
+
+        if delta_kg > 0.02:  # jitter deadband
+            oz = round(delta_kg * KG_TO_OZ, 1)
+            p["last_pour_oz"] = oz
+            p["daily_oz"] = round(float(p.get("daily_oz") or 0.0) + oz, 1)
+
+        p["last_total_kg"] = curr
+
+        norm["last_pour_oz"] = float(p.get("last_pour_oz") or 0.0)
+        norm["daily_consumption_oz"] = float(p.get("daily_oz") or 0.0)
+
+    def _apply_meta_and_expiration(keg_id: str, norm: dict) -> None:
+        meta = (state.get("meta") or {}).get(keg_id, {})
+        kegged = meta.get(ATTR_KEGGED_DATE)
+        exp = meta.get(ATTR_EXPIRATION_DATE)
+
+        norm[ATTR_KEGGED_DATE] = kegged if isinstance(kegged, str) else None
+        norm[ATTR_EXPIRATION_DATE] = exp if isinstance(exp, str) else None
+        norm[ATTR_DAYS_UNTIL_EXPIRATION] = _days_until(exp) if exp else None
+
     async def publish_kegs(payload_list: List[dict]) -> None:
         for raw in payload_list:
             if not isinstance(raw, dict):
                 continue
             norm = _normalize_v2(raw)
             keg_id = norm["id"]
-            norm = _apply_meta_and_stats(keg_id, norm)
+
+            _update_pour_stats(keg_id, norm)
+            _apply_meta_and_expiration(keg_id, norm)
 
             state["raw"][keg_id] = raw
             state["data"][keg_id] = norm
@@ -334,20 +330,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.bus.async_fire(PLATFORM_EVENT, {"keg_id": keg_id})
 
         # keep devices list sane even if devices endpoint fails
-        known = set(state.get("devices") or [])
-        for kid in state["data"].keys():
-            known.add(kid)
+        known = list(dict.fromkeys([*(state.get("devices") or []), *state["data"].keys()]))
+        state["devices"] = known
+        hass.bus.async_fire(DEVICES_UPDATE_EVENT, {"ids": known})
 
-        # also fold in /connected if present
-        try:
-            connected = await fetch_connected()
-            for kid in connected:
-                known.add(kid)
-        except Exception:
-            connected = state.get("connected", [])
-
-        state["devices"] = list(known)
-        hass.bus.async_fire(DEVICES_UPDATE_EVENT, {"ids": list(known), "connected": list(connected)})
+        # keep selected_device valid
+        if state.get("selected_device") not in known:
+            state["selected_device"] = known[0] if known else None
 
     async def rest_poll(_now=None) -> None:
         try:
@@ -358,10 +347,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def devices_poll(_now=None) -> None:
         await fetch_devices()
-        await fetch_connected()
 
     async def connect_websocket() -> None:
-        """WS connects to ws_url and expects messages like: [ {keg}, {keg} ]"""
+        """WS connects to ws_url and expects: [ {keg}, {keg} ]"""
         while True:
             try:
                 _LOGGER.info("%s: Connecting WS -> %s", DOMAIN, ws_url)
@@ -385,200 +373,202 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.warning("%s: WS disconnected (%s). Reconnecting...", DOMAIN, e)
                 await asyncio.sleep(WS_RECONNECT_DELAY)
 
-    # ----------------------------
-    # Manual date services
-    # ----------------------------
-    def _resolve_keg_id(call: ServiceCall) -> str | None:
-        kid = call.data.get("id")
-        if kid:
-            return str(kid)
-        keys = list((state.get("data") or {}).keys())
-        if len(keys) == 1:
-            return keys[0]
-        return None
+    # -------------------------
+    # Services helpers
+    # -------------------------
+    def _resolve_keg_id(call: ServiceCall) -> Optional[str]:
+        if call.data.get("id"):
+            return str(call.data["id"])
+        if state.get("selected_device"):
+            return str(state["selected_device"])
+        devices = state.get("devices") or []
+        return str(devices[0]) if devices else None
+
+    async def _notify(title: str, msg: str) -> None:
+        await pn_create(hass, msg, title=title)
+
+    async def _post_cmd(keg_id: str, cmd: str, payload: dict | None = None) -> tuple[int, str]:
+        url = f"{base}/api/kegs/{keg_id}/{cmd}"
+        try:
+            async with session.post(url, json=payload or {}) as resp:
+                txt = await resp.text()
+                return resp.status, txt
+        except Exception as e:
+            return 0, str(e)
+
+    async def _get_connected() -> tuple[int, str]:
+        url = f"{base}/api/kegs/connected"
+        try:
+            async with session.get(url) as resp:
+                txt = await resp.text()
+                return resp.status, txt
+        except Exception as e:
+            return 0, str(e)
+
+    # -------------------------
+    # Service: manual dates (id optional)
+    # -------------------------
+    _SCHEMA_SET_DATES = vol.Schema(
+        {
+            vol.Optional("id"): cv.string,
+            vol.Optional("kegged_date"): cv.string,      # MM/DD/YYYY
+            vol.Optional("expiration_date"): cv.string,  # MM/DD/YYYY
+        }
+    )
 
     async def set_keg_dates(call: ServiceCall) -> None:
         keg_id = _resolve_keg_id(call)
         if not keg_id:
-            _LOGGER.warning("%s: set_keg_dates: missing id (and not exactly one keg present)", DOMAIN)
+            await _notify("Beer Keg Dates", "No keg id available (no devices discovered yet).")
             return
 
         kegged = call.data.get("kegged_date")
-        expires = call.data.get("expiration_date")
+        exp = call.data.get("expiration_date")
 
-        if kegged is not None and _parse_mmddyyyy(str(kegged)) is None:
-            raise vol.Invalid(f"kegged_date must be MM/DD/YYYY (got '{kegged}')")
-        if expires is not None and _parse_mmddyyyy(str(expires)) is None:
-            raise vol.Invalid(f"expiration_date must be MM/DD/YYYY (got '{expires}')")
+        if kegged is not None and _parse_mmddyyyy(kegged) is None:
+            await _notify("Beer Keg Dates", f"Invalid kegged_date. Use {DATE_FORMAT} (MM/DD/YYYY).")
+            return
+        if exp is not None and _parse_mmddyyyy(exp) is None:
+            await _notify("Beer Keg Dates", f"Invalid expiration_date. Use {DATE_FORMAT} (MM/DD/YYYY).")
+            return
 
         meta = state.setdefault("meta", {})
-        cur = meta.get(keg_id) or {}
+        meta.setdefault(keg_id, {})
         if kegged is not None:
-            cur[ATTR_KEGGED_DATE] = str(kegged)
-        if expires is not None:
-            cur[ATTR_EXPIRATION_DATE] = str(expires)
-        meta[keg_id] = cur
+            meta[keg_id][ATTR_KEGGED_DATE] = kegged
+        if exp is not None:
+            meta[keg_id][ATTR_EXPIRATION_DATE] = exp
 
         await state["meta_store"].async_save(meta)
 
         if keg_id in state.get("data", {}):
-            state["data"][keg_id] = _apply_meta_and_stats(keg_id, state["data"][keg_id])
+            _apply_meta_and_expiration(keg_id, state["data"][keg_id])
             hass.bus.async_fire(PLATFORM_EVENT, {"keg_id": keg_id})
 
-    async def clear_keg_dates(call: ServiceCall) -> None:
+        await _notify("Beer Keg Dates", f"Dates saved for {keg_id}")
+
+    _register_service_once(hass, "set_keg_dates", set_keg_dates, schema=_SCHEMA_SET_DATES)
+
+    # -------------------------
+    # Services: Command API
+    # -------------------------
+    _SCHEMA_ID = vol.Schema({vol.Optional("id"): cv.string})
+    _SCHEMA_FLOAT = vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.Coerce(float)})
+    _SCHEMA_INT = vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.Coerce(int)})
+    _SCHEMA_STR = vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): cv.string})
+
+    async def cmd_tare(call: ServiceCall) -> None:
         keg_id = _resolve_keg_id(call)
         if not keg_id:
-            _LOGGER.warning("%s: clear_keg_dates: missing id (and not exactly one keg present)", DOMAIN)
+            await _notify("Beer Keg Command", "No keg id available.")
             return
-        meta = state.setdefault("meta", {})
-        if keg_id in meta:
-            meta.pop(keg_id, None)
-            await state["meta_store"].async_save(meta)
-        if keg_id in state.get("data", {}):
-            state["data"][keg_id][ATTR_KEGGED_DATE] = None
-            state["data"][keg_id][ATTR_EXPIRATION_DATE] = None
-            state["data"][keg_id][ATTR_DAYS_UNTIL_EXPIRATION] = None
-            hass.bus.async_fire(PLATFORM_EVENT, {"keg_id": keg_id})
+        status, body = await _post_cmd(keg_id, "tare")
+        await _notify("Beer Keg Command", f"tare ({keg_id}) -> {status}\n{body[:500]}")
 
-    hass.services.async_register(
-        DOMAIN,
-        "set_keg_dates",
-        set_keg_dates,
-        schema=vol.Schema(
-            {
-                vol.Optional("id"): cv.string,
-                vol.Optional("kegged_date"): cv.string,
-                vol.Optional("expiration_date"): cv.string,
-            }
-        ),
-    )
-    hass.services.async_register(
-        DOMAIN,
-        "clear_keg_dates",
-        clear_keg_dates,
-        schema=vol.Schema({vol.Optional("id"): cv.string}),
-    )
-
-    # ----------------------------
-    # Keg Command API services
-    # ----------------------------
-    async def _post_cmd(keg_id: str, cmd: str, payload: dict | None = None) -> tuple[int, str]:
-        url = f"{base}/api/kegs/{keg_id}/{cmd}"
-        async with session.post(url, json=payload or {}) as resp:
-            txt = await resp.text()
-            return resp.status, txt
-
-    async def _cmd(call: ServiceCall, cmd: str, payload: dict | None = None) -> None:
+    async def cmd_empty_keg(call: ServiceCall) -> None:
         keg_id = _resolve_keg_id(call)
         if not keg_id:
-            _LOGGER.warning("%s: command %s: missing id", DOMAIN, cmd)
+            await _notify("Beer Keg Command", "No keg id available.")
             return
-        status, body = await _post_cmd(keg_id, cmd, payload)
-        if status == 404:
-            _LOGGER.warning("%s: command API not supported by server (404) for %s", DOMAIN, cmd)
+        status, body = await _post_cmd(keg_id, "empty-keg", {"value": float(call.data["value"])})
+        await _notify("Beer Keg Command", f"empty-keg ({keg_id}) -> {status}\n{body[:500]}")
+
+    async def cmd_max_volume(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if not keg_id:
+            await _notify("Beer Keg Command", "No keg id available.")
             return
-        if status >= 300:
-            _LOGGER.warning("%s: command %s failed for %s -> HTTP %s: %s", DOMAIN, cmd, keg_id, status, body[:200])
+        status, body = await _post_cmd(keg_id, "max-keg-volume", {"value": float(call.data["value"])})
+        await _notify("Beer Keg Command", f"max-keg-volume ({keg_id}) -> {status}\n{body[:500]}")
+
+    async def cmd_temp_offset(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if not keg_id:
+            await _notify("Beer Keg Command", "No keg id available.")
             return
+        status, body = await _post_cmd(keg_id, "temperature-offset", {"value": float(call.data["value"])})
+        await _notify("Beer Keg Command", f"temperature-offset ({keg_id}) -> {status}\n{body[:500]}")
 
-        # If command likely changes readings, refresh once
-        await rest_poll()
+    async def cmd_calibrate_known(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if not keg_id:
+            await _notify("Beer Keg Command", "No keg id available.")
+            return
+        status, body = await _post_cmd(keg_id, "calibrate-known-weight", {"value": float(call.data["value"])})
+        await _notify("Beer Keg Command", f"calibrate-known-weight ({keg_id}) -> {status}\n{body[:500]}")
 
-    async def keg_tare(call: ServiceCall) -> None:
-        await _cmd(call, "tare")
+    async def cmd_beer_style(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if not keg_id:
+            await _notify("Beer Keg Command", "No keg id available.")
+            return
+        status, body = await _post_cmd(keg_id, "beer-style", {"value": str(call.data["value"])})
+        await _notify("Beer Keg Command", f"beer-style ({keg_id}) -> {status}\n{body[:500]}")
 
-    async def keg_empty_keg(call: ServiceCall) -> None:
-        await _cmd(call, "empty-keg", {"value": float(call.data["value"])})
+    async def cmd_date(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if not keg_id:
+            await _notify("Beer Keg Command", "No keg id available.")
+            return
+        status, body = await _post_cmd(keg_id, "date", {"value": str(call.data["value"])})
+        await _notify("Beer Keg Command", f"date ({keg_id}) -> {status}\n{body[:500]}")
 
-    async def keg_max_keg_volume(call: ServiceCall) -> None:
-        await _cmd(call, "max-keg-volume", {"value": float(call.data["value"])})
+    async def cmd_unit(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if not keg_id:
+            await _notify("Beer Keg Command", "No keg id available.")
+            return
+        status, body = await _post_cmd(keg_id, "unit", {"value": str(call.data["value"]).lower()})
+        await _notify("Beer Keg Command", f"unit ({keg_id}) -> {status}\n{body[:500]}")
 
-    async def keg_temperature_offset(call: ServiceCall) -> None:
-        await _cmd(call, "temperature-offset", {"value": float(call.data["value"])})
+    async def cmd_measure_unit(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if not keg_id:
+            await _notify("Beer Keg Command", "No keg id available.")
+            return
+        status, body = await _post_cmd(keg_id, "measure-unit", {"value": str(call.data["value"]).lower()})
+        await _notify("Beer Keg Command", f"measure-unit ({keg_id}) -> {status}\n{body[:500]}")
 
-    async def keg_calibrate_known_weight(call: ServiceCall) -> None:
-        await _cmd(call, "calibrate-known-weight", {"value": float(call.data["value"])})
+    async def cmd_keg_mode(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if not keg_id:
+            await _notify("Beer Keg Command", "No keg id available.")
+            return
+        status, body = await _post_cmd(keg_id, "keg-mode", {"value": str(call.data["value"]).lower()})
+        await _notify("Beer Keg Command", f"keg-mode ({keg_id}) -> {status}\n{body[:500]}")
 
-    async def keg_beer_style(call: ServiceCall) -> None:
-        await _cmd(call, "beer-style", {"value": str(call.data["value"])})
+    async def cmd_sensitivity(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if not keg_id:
+            await _notify("Beer Keg Command", "No keg id available.")
+            return
+        status, body = await _post_cmd(keg_id, "sensitivity", {"value": int(call.data["value"])})
+        await _notify("Beer Keg Command", f"sensitivity ({keg_id}) -> {status}\n{body[:500]}")
 
-    async def keg_date(call: ServiceCall) -> None:
-        # server decides format; we pass through string
-        await _cmd(call, "date", {"value": str(call.data["value"])})
+    async def get_connected(_call: ServiceCall) -> None:
+        status, body = await _get_connected()
+        await _notify("Beer Keg Connected", f"connected -> {status}\n{body[:1000]}")
 
-    async def keg_unit(call: ServiceCall) -> None:
-        await _cmd(call, "unit", {"value": str(call.data["value"]).lower()})
+    _register_service_once(hass, "keg_tare", cmd_tare, schema=_SCHEMA_ID)
+    _register_service_once(hass, "keg_set_empty_keg_weight", cmd_empty_keg, schema=_SCHEMA_FLOAT)
+    _register_service_once(hass, "keg_set_max_keg_volume", cmd_max_volume, schema=_SCHEMA_FLOAT)
+    _register_service_once(hass, "keg_set_temperature_offset", cmd_temp_offset, schema=_SCHEMA_FLOAT)
+    _register_service_once(hass, "keg_calibrate_known_weight", cmd_calibrate_known, schema=_SCHEMA_FLOAT)
+    _register_service_once(hass, "keg_set_beer_style", cmd_beer_style, schema=_SCHEMA_STR)
+    _register_service_once(hass, "keg_set_date", cmd_date, schema=_SCHEMA_STR)
+    _register_service_once(hass, "keg_set_unit_system", cmd_unit, schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.In(["metric", "us"])}))
+    _register_service_once(hass, "keg_set_measure_unit", cmd_measure_unit, schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.In(["weight", "volume"])}))
+    _register_service_once(hass, "keg_set_mode", cmd_keg_mode, schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.In(["beer", "co2"])}))
+    _register_service_once(hass, "keg_set_sensitivity", cmd_sensitivity, schema=_SCHEMA_INT)
+    _register_service_once(hass, "keg_get_connected", get_connected, schema=vol.Schema({}))
 
-    async def keg_measure_unit(call: ServiceCall) -> None:
-        await _cmd(call, "measure-unit", {"value": str(call.data["value"]).lower()})
+    async def on_stop(_event) -> None:
+        try:
+            await state["meta_store"].async_save(state.get("meta", {}))
+        except Exception:
+            pass
 
-    async def keg_keg_mode(call: ServiceCall) -> None:
-        await _cmd(call, "keg-mode", {"value": str(call.data["value"]).lower()})
-
-    async def keg_sensitivity(call: ServiceCall) -> None:
-        await _cmd(call, "sensitivity", {"value": int(call.data["value"])})
-
-    hass.services.async_register(DOMAIN, "keg_tare", keg_tare, schema=vol.Schema({vol.Optional("id"): cv.string}))
-    hass.services.async_register(
-        DOMAIN,
-        "keg_set_empty_keg_weight",
-        keg_empty_keg,
-        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.Coerce(float)}),
-    )
-    hass.services.async_register(
-        DOMAIN,
-        "keg_set_max_keg_volume",
-        keg_max_keg_volume,
-        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.Coerce(float)}),
-    )
-    hass.services.async_register(
-        DOMAIN,
-        "keg_set_temperature_offset",
-        keg_temperature_offset,
-        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.Coerce(float)}),
-    )
-    hass.services.async_register(
-        DOMAIN,
-        "keg_calibrate_known_weight",
-        keg_calibrate_known_weight,
-        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.Coerce(float)}),
-    )
-    hass.services.async_register(
-        DOMAIN,
-        "keg_set_beer_style",
-        keg_beer_style,
-        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): cv.string}),
-    )
-    hass.services.async_register(
-        DOMAIN,
-        "keg_set_date",
-        keg_date,
-        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): cv.string}),
-    )
-    hass.services.async_register(
-        DOMAIN,
-        "keg_set_unit_system",
-        keg_unit,
-        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.In(["metric", "us"])}),
-    )
-    hass.services.async_register(
-        DOMAIN,
-        "keg_set_measure_unit",
-        keg_measure_unit,
-        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.In(["weight", "volume"])}),
-    )
-    hass.services.async_register(
-        DOMAIN,
-        "keg_set_mode",
-        keg_keg_mode,
-        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.In(["beer", "co2"])}),
-    )
-    hass.services.async_register(
-        DOMAIN,
-        "keg_set_sensitivity",
-        keg_sensitivity,
-        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.Coerce(int)}),
-    )
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, on_stop)
 
     async def _start(_event=None) -> None:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
