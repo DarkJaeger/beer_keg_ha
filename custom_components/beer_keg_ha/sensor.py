@@ -10,103 +10,211 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, ATTR_PLAATO_API_V2, ATTR_PLAATO_API_VERSION
+from .const import DOMAIN, PLATFORM_EVENT, ATTR_LAST_UPDATE
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORM_EVENT = f"{DOMAIN}_update"
-
+# v2-only sensors: raw + derived
 SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
-    # --- RAW BASE SENSORS (HA-native, fixed units) ---
-    "weight": {
-        "unit": "kg",
-        "name": "Weight",
-        "key": "weight",
+    # -------------------------
+    # Derived (computed)
+    # -------------------------
+    "total_weight_kg": {
+        "name": "Total Weight",
+        "key": "total_weight_kg",
         "icon": "mdi:scale",
         "device_class": "weight",
         "state_class": "measurement",
-    },
-    "beer_weight": {
         "unit": "kg",
-        "name": "Beer Weight",
-        "key": "beer_weight",
+        "round": 3,
+    },
+    "beer_remaining_kg": {
+        "name": "Beer Remaining",
+        "key": "beer_remaining_kg",
         "icon": "mdi:beer",
         "device_class": "weight",
         "state_class": "measurement",
-    },   
-    "temperature": {
-        "unit": "°C",
+        "unit": "kg",
+        "round": 3,
+    },
+    "liters_remaining": {
+        "name": "Beer Remaining",
+        "key": "liters_remaining",
+        "icon": "mdi:cup",
+        "device_class": "volume",
+        "state_class": None,  # remaining is a level
+        "unit": "L",
+        "round": 3,
+    },
+
+    # -------------------------
+    # Raw v2 fields (from API)
+    # -------------------------
+    "empty_keg_weight": {
+        "name": "Empty Keg Weight",
+        "key": "empty_keg_weight",
+        "icon": "mdi:weight",
+        "device_class": "weight",
+        "state_class": "measurement",
+        "unit": "kg",
+        "round": 3,
+    },
+
+    # amount_left meaning depends on beer_left_unit (kg or L)
+    "amount_left": {
+        "name": "Amount Left (Raw)",
+        "key": "amount_left",
+        "icon": "mdi:cup",
+        "device_class": None,
+        "state_class": None,
+        "unit": None,  # dynamic
+        "round": 3,
+    },
+
+    "percent_of_beer_left": {
+        "name": "Percent of Beer Left",
+        "key": "percent_of_beer_left",
+        "icon": "mdi:percent",
+        "device_class": None,
+        "state_class": "measurement",
+        "unit": "%",
+        "round": 1,
+    },
+
+    # Temperatures
+    "keg_temperature_c": {
         "name": "Temperature",
-        "key": "temperature",
+        "key": "keg_temperature_c",
         "icon": "mdi:thermometer",
         "device_class": "temperature",
         "state_class": "measurement",
+        "unit": "°C",
+        "round": 2,
+    },
+    "chip_temperature_c": {
+        "name": "Chip Temperature",
+        "key": "chip_temperature_c",
+        "icon": "mdi:chip",
+        "device_class": "temperature",
+        "state_class": "measurement",
+        "unit": "°C",
+        "round": 2,
+    },
+    "temperature_offset": {
+        "name": "Temperature Offset",
+        "key": "temperature_offset",
+        "icon": "mdi:thermometer-plus",
+        "device_class": "temperature",
+        "state_class": "measurement",
+        "unit": "°C",
+        "round": 3,
+    },
+    "min_temperature": {
+        "name": "Min Temperature",
+        "key": "min_temperature",
+        "icon": "mdi:thermometer-low",
+        "device_class": "temperature",
+        "state_class": "measurement",
+        "unit": "°C",
+        "round": 3,
+    },
+    "max_temperature": {
+        "name": "Max Temperature",
+        "key": "max_temperature",
+        "icon": "mdi:thermometer-high",
+        "device_class": "temperature",
+        "state_class": "measurement",
+        "unit": "°C",
+        "round": 3,
     },
 
-    # --- NEW: API v2 native liters remaining (L) ---
-    "liters_remaining": {
-        "unit": "L",
-        "name": "Liters Remaining",
-        "key": "liters_left",
-        "icon": "mdi:cup",
-        "device_class": "volume",
-        "state_class": None,  # FIX: remaining volume is a "level", not a measurement/total
-    },
-
-
-    # --- FILL LEVEL ---
-    "fill_percent": {
-        "unit": "%",
-        "name": "Fill Level",
-        "key": "fill_percent",
-        "icon": "mdi:cup",
+    # WiFi strength on this server is a percent (0-100) not dBm; keep as plain numeric
+    "wifi_signal_strength": {
+        "name": "WiFi Signal",
+        "key": "wifi_signal_strength",
+        "icon": "mdi:wifi",
         "device_class": None,
         "state_class": "measurement",
+        "unit": "%",
+        "round": None,
     },
 
-    # --- POUR / CONSUMPTION (base = oz) ---
+    # Booleans/flags (keep as simple sensors: no device_class/state_class)
+    "leak_detection": {
+        "name": "Leak Detection",
+        "key": "leak_detection",
+        "icon": "mdi:water-alert",
+        "device_class": None,
+        "state_class": None,
+        "unit": None,
+        "round": None,
+    },
+    "is_pouring": {
+        "name": "Is Pouring",
+        "key": "is_pouring",
+        "icon": "mdi:cup-water",
+        "device_class": None,
+        "state_class": None,
+        "unit": None,
+        "round": None,
+    },
+
+    # Pour info
     "last_pour": {
-        "unit": "oz",
-        "name": "Last Pour (oz)",
+        "name": "Last Pour (Raw)",
         "key": "last_pour",
         "icon": "mdi:cup-water",
         "device_class": None,
         "state_class": "measurement",
+        "unit": None,
+        "round": 3,
     },
-    "daily_consumed": {
-        "unit": "oz",
-        "name": "Daily Consumption (oz)",
-        "key": "daily_consumed",
-        "icon": "mdi:beer",
+    "last_pour_string": {
+        "name": "Last Pour",
+        "key": "last_pour_string",
+        "icon": "mdi:cup-water",
         "device_class": None,
-        "state_class": "total_increasing",
+        "state_class": None,
+        "unit": None,
+        "round": None,
     },
 
-    # --- FULL WEIGHT / META ---
-    "full_weight": {
-        "unit": "kg",
-        "name": "Full Weight",
-        "key": "full_weight",
-        "icon": "mdi:weight",
-        "device_class": "weight",
-        "state_class": "measurement",
+    # Volume config
+    "max_keg_volume": {
+        "name": "Max Keg Volume",
+        "key": "max_keg_volume",
+        "icon": "mdi:keg",
+        "device_class": "volume",
+        "state_class": None,  # not an accumulating counter
+        "unit": "L",
+        "round": 3,
     },
-    "name": {
-        "unit": None,
-        "name": "Name",
-        "key": "name",
-        "icon": "mdi:barcode",
-        "device_class": None,
-        "state_class": None,
-    },
-    "id": {
-        "unit": None,
-        "name": "ID",
-        "key": "id",
-        "icon": "mdi:identifier",
-        "device_class": None,
-        "state_class": None,
-    },
+
+    # Misc numeric settings
+    "measure_unit": {"name": "Measure Unit", "key": "measure_unit", "icon": "mdi:tune", "device_class": None, "state_class": None, "unit": None, "round": None},
+    "unit": {"name": "Unit System", "key": "unit", "icon": "mdi:ruler", "device_class": None, "state_class": None, "unit": None, "round": None},
+
+    # Units as strings
+    "volume_unit": {"name": "Volume Unit", "key": "volume_unit", "icon": "mdi:format-letter-case", "device_class": None, "state_class": None, "unit": None, "round": None},
+    "beer_left_unit": {"name": "Beer Left Unit", "key": "beer_left_unit", "icon": "mdi:format-letter-case", "device_class": None, "state_class": None, "unit": None, "round": None},
+    "temperature_unit": {"name": "Temperature Unit", "key": "temperature_unit", "icon": "mdi:format-letter-case", "device_class": None, "state_class": None, "unit": None, "round": None},
+
+    # Firmware / strings
+    "firmware_version": {"name": "Firmware Version", "key": "firmware_version", "icon": "mdi:identifier", "device_class": None, "state_class": None, "unit": None, "round": None},
+    "keg_temperature_string": {"name": "Temperature (String)", "key": "keg_temperature_string", "icon": "mdi:thermometer", "device_class": None, "state_class": None, "unit": None, "round": None},
+    "chip_temperature_string": {"name": "Chip Temp (String)", "key": "chip_temperature_string", "icon": "mdi:chip", "device_class": None, "state_class": None, "unit": None, "round": None},
+
+    # Gravity
+    "og": {"name": "OG", "key": "og", "icon": "mdi:alpha-o-circle", "device_class": None, "state_class": None, "unit": None, "round": None},
+    "fg": {"name": "FG", "key": "fg", "icon": "mdi:alpha-f-circle", "device_class": None, "state_class": None, "unit": None, "round": None},
+
+    # ---- Internal flattened fields (require __init__.py normalize to output these keys) ----
+    "internal_ver": {"name": "Internal Version", "key": "internal_ver", "icon": "mdi:information", "device_class": None, "state_class": None, "unit": None, "round": None},
+    "internal_fw": {"name": "Internal FW", "key": "internal_fw", "icon": "mdi:information", "device_class": None, "state_class": None, "unit": None, "round": None},
+    "internal_dev": {"name": "Internal Device", "key": "internal_dev", "icon": "mdi:chip", "device_class": None, "state_class": None, "unit": None, "round": None},
+    "internal_build": {"name": "Internal Build", "key": "internal_build", "icon": "mdi:calendar", "device_class": None, "state_class": None, "unit": None, "round": None},
+    "internal_tmpl": {"name": "Internal Template", "key": "internal_tmpl", "icon": "mdi:tag", "device_class": None, "state_class": None, "unit": None, "round": None},
+    "internal_hbeat": {"name": "Internal Heartbeat", "key": "internal_hbeat", "icon": "mdi:heart-pulse", "device_class": None, "state_class": "measurement", "unit": "s", "round": None},
 }
 
 
@@ -115,11 +223,9 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up keg sensors for a config entry."""
     state = hass.data[DOMAIN][entry.entry_id]
     created: Set[str] = state.setdefault("created_kegs", set())
 
-    # One debug sensor per config entry
     async_add_entities([BeerKegDebugSensor(hass, entry)], True)
 
     def create_for(keg_id: str) -> None:
@@ -132,7 +238,6 @@ async def async_setup_entry(
         async_add_entities(ents, True)
         created.add(keg_id)
 
-    # create for any already-known kegs
     for keg_id in list(state.get("data", {}).keys()):
         create_for(keg_id)
 
@@ -162,7 +267,7 @@ class KegSensor(SensorEntity):
         self._attr_icon = self._meta.get("icon")
         self._attr_device_class = self._meta.get("device_class")
         self._attr_state_class = self._meta.get("state_class")
-        self._attr_native_unit_of_measurement = self._meta.get("unit")
+        self._static_unit = self._meta.get("unit")
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -170,9 +275,22 @@ class KegSensor(SensorEntity):
         return DeviceInfo(
             identifiers={(DOMAIN, f"{self.entry.entry_id}_{self.keg_id}")},
             name=f"Beer Keg {short_id}",
-            manufacturer="Beer Keg",
-            model="WebSocket + REST",
+            manufacturer="open-plaato-keg",
+            model="API v2",
         )
+
+    @property
+    def native_unit_of_measurement(self) -> str | None:
+        # amount_left is dynamic: depends on beer_left_unit
+        if self.sensor_type == "amount_left":
+            d = self._state_ref.get("data", {}).get(self.keg_id, {})
+            u = str(d.get("beer_left_unit") or "").lower()
+            if u in ("kg", "kilogram", "kilograms"):
+                return "kg"
+            if u in ("litre", "liter", "liters", "litres", "l"):
+                return "L"
+            return None
+        return self._static_unit
 
     @property
     def native_value(self) -> Any:
@@ -181,20 +299,10 @@ class KegSensor(SensorEntity):
         if raw is None:
             return None
 
-        # liters_remaining should be numeric if present; it will be None on v1 servers
-        if self.sensor_type == "liters_remaining":
-            try:
-                return round(float(raw), 3)
-            except Exception:
-                return None
-        if self.sensor_type == "beer_weight":
-            try:
-                return round(float(raw), 2)
-            except Exception:
-                return None
-
+        r = self._meta.get("round")
+        if isinstance(raw, (int, float)) and isinstance(r, int):
+            return round(float(raw), r)
         return raw
-        
 
     async def async_added_to_hass(self) -> None:
         self.async_on_remove(self.hass.bus.async_listen(PLATFORM_EVENT, self._refresh_if_mine))
@@ -220,14 +328,14 @@ class BeerKegDebugSensor(SensorEntity):
         return DeviceInfo(
             identifiers={(DOMAIN, f"{self.entry.entry_id}_settings")},
             name="Beer Keg Settings",
-            manufacturer="Beer Keg",
-            model="WebSocket + REST",
+            manufacturer="open-plaato-keg",
+            model="API v2",
         )
 
     @property
     def native_value(self) -> float | None:
-        state = self.hass.data[DOMAIN][self.entry.entry_id]
-        ts = state.get("last_update_ts")
+        st = self.hass.data[DOMAIN][self.entry.entry_id]
+        ts = st.get(ATTR_LAST_UPDATE)
         if not isinstance(ts, datetime):
             return None
         age = (datetime.now(timezone.utc) - ts).total_seconds()
@@ -235,10 +343,9 @@ class BeerKegDebugSensor(SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict:
-        state = self.hass.data[DOMAIN][self.entry.entry_id]
+        st = self.hass.data[DOMAIN][self.entry.entry_id]
         return {
-            "ws_url": state.get("ws_url"),
-            "devices": list(state.get("devices", [])),
-            ATTR_PLAATO_API_VERSION: state.get(ATTR_PLAATO_API_VERSION, "v1"),
-            ATTR_PLAATO_API_V2: bool(state.get(ATTR_PLAATO_API_V2, False)),
+            "ws_url": st.get("ws_url"),
+            "devices": list(st.get("devices", [])),
+            "kegs": list(st.get("data", {}).keys()),
         }

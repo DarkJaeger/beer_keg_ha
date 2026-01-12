@@ -2,6 +2,8 @@ DOMAIN = "beer_keg_ha"
 
 # Config keys
 CONF_WS_URL = "ws_url"
+
+# (Optional legacy keys — safe to keep even if v2-only; remove later if you want)
 CONF_EMPTY_WEIGHT = "empty_weight"
 CONF_DEFAULT_FULL_WEIGHT = "default_full_weight"
 CONF_POUR_THRESHOLD = "pour_threshold"
@@ -20,10 +22,15 @@ DEFAULT_FULL_VOLUME_L = 19.0
 DEFAULT_BEER_SG = 1.010
 WATER_DENSITY_KG_PER_L = 0.998
 
-# History
+# History (not used in the v2-only minimal build, but harmless)
 MAX_LOG_ENTRIES = 500
 
-# Runtime flags / diagnostics
-ATTR_PLAATO_API_VERSION = "plaato_api_version"  # "v1" | "v2"
-ATTR_PLAATO_API_V2 = "plaato_api_v2"            # bool
+# Integration version (optional; HA uses manifest.json version)
+VERSION = "2.0.0"
 
+# --- Runtime/events (needed by v2-only __init__.py + sensor/select) ---
+PLATFORM_EVENT = f"{DOMAIN}_update"
+DEVICES_UPDATE_EVENT = f"{DOMAIN}_devices_update"
+
+# --- Runtime state keys ---
+ATTR_LAST_UPDATE = "last_update_ts"
