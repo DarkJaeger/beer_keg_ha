@@ -1,11 +1,9 @@
-# __init__.py (drop-in replacement with fixes)
-
 from __future__ import annotations
 
 import asyncio
-import calendar
 import json
 import logging
+import calendar
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, urlunparse
@@ -35,7 +33,8 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = ["sensor", "select"]
+# ✅ ADDED binary_sensor
+PLATFORMS = ["sensor", "select", "binary_sensor"]
 
 REST_POLL_SECONDS = 10
 DEVICES_REFRESH_SEC = 60
@@ -43,7 +42,6 @@ WS_RECONNECT_DELAY = 5
 
 KG_TO_OZ = 35.274
 
-# v2 payload sometimes reports liters, sometimes kg; use SG only for L->kg estimate
 DEFAULT_BEER_SG = 1.010
 WATER_DENSITY_KG_PER_L = 0.998
 
@@ -78,7 +76,6 @@ def _parse_temp_from_string(s: str | None) -> float | None:
 
 
 def _parse_mmddyyyy(s: Any) -> Optional[datetime]:
-    """Parse MM/DD/YYYY -> aware UTC datetime at 00:00:00."""
     if not isinstance(s, str) or not s.strip():
         return None
     try:
@@ -89,14 +86,6 @@ def _parse_mmddyyyy(s: Any) -> Optional[datetime]:
 
 
 def _parse_date_flexible(s: Any) -> Optional[datetime]:
-    """
-    Accept:
-      - MM/DD/YYYY (DATE_FORMAT)
-      - MM.DD.YYYY  (payload example)
-      - MM-DD-YYYY
-      - YYYY-MM-DD
-    Return UTC aware at 00:00:00.
-    """
     if not isinstance(s, str) or not s.strip():
         return None
     s = s.strip()
@@ -140,7 +129,6 @@ def _normalize_payload_date_to_mmddyyyy(s: Any) -> Optional[str]:
 
 
 def _coerce_gravity_1xxx(v: Any) -> float | None:
-    """Accept 1.xxx style OG/FG; returns float or None."""
     try:
         f = float(str(v).strip())
     except Exception:
@@ -151,7 +139,6 @@ def _coerce_gravity_1xxx(v: Any) -> float | None:
 
 
 def _add_months(dt: datetime, months: int) -> datetime:
-    """Add months to dt, clamping day to last day of target month."""
     y = dt.year + (dt.month - 1 + months) // 12
     m = (dt.month - 1 + months) % 12 + 1
     last_day = calendar.monthrange(y, m)[1]
@@ -160,10 +147,6 @@ def _add_months(dt: datetime, months: int) -> datetime:
 
 
 def _calc_expiration_from_keg_date(keg_date_str: Any) -> Optional[str]:
-    """
-    Given a keg date string (flexible formats), compute expiration = +6 months
-    and return as MM/DD/YYYY.
-    """
     dt = _parse_date_flexible(keg_date_str)
     if not dt:
         return None
@@ -172,7 +155,6 @@ def _calc_expiration_from_keg_date(keg_date_str: Any) -> Optional[str]:
 
 
 def _normalize_v2(keg: dict) -> dict:
-    """Normalize ONE keg payload from WS/REST (v2 only)."""
     keg_id = str(keg.get("id", "unknown"))
     short_id = keg_id[:4]
 
@@ -186,7 +168,7 @@ def _normalize_v2(keg: dict) -> dict:
 
     amount_left = _coerce_float(keg.get("amount_left"))
     if amount_left is not None:
-        amount_left = max(0.0, amount_left)  # server can send negatives
+        amount_left = max(0.0, amount_left)
 
     percent_left = _coerce_float(keg.get("percent_of_beer_left"))
     if percent_left is not None:
@@ -197,7 +179,6 @@ def _normalize_v2(keg: dict) -> dict:
 
     wifi = _coerce_int(keg.get("wifi_signal_strength"))
 
-    # -------- internal flatten --------
     internal = keg.get("internal") if isinstance(keg.get("internal"), dict) else {}
     internal_ver = internal.get("ver")
     internal_fw = internal.get("fw")
@@ -206,7 +187,6 @@ def _normalize_v2(keg: dict) -> dict:
     internal_tmpl = internal.get("tmpl")
     internal_hbeat = _coerce_int(internal.get("h-beat"))
 
-    # -------- derived units --------
     liters_remaining: float | None = None
     beer_remaining_kg: float | None = None
 
@@ -224,7 +204,6 @@ def _normalize_v2(keg: dict) -> dict:
     if empty_keg_weight is not None and beer_remaining_kg is not None:
         total_weight_kg = empty_keg_weight + beer_remaining_kg
 
-    # -------- NEW payload fields --------
     my_beer_style = keg.get("my_beer_style")
     my_keg_date = _normalize_payload_date_to_mmddyyyy(keg.get("my_keg_date"))
     my_og = _coerce_gravity_1xxx(keg.get("my_og"))
@@ -234,7 +213,7 @@ def _normalize_v2(keg: dict) -> dict:
     return {
         "id": keg_id,
         "short_id": short_id,
-        # raw fields (as sensors)
+
         "firmware_version": keg.get("firmware_version"),
         "chip_temperature_string": keg.get("chip_temperature_string"),
         "max_temperature": _coerce_float(keg.get("max_temperature")),
@@ -249,7 +228,10 @@ def _normalize_v2(keg: dict) -> dict:
         "og": _coerce_int(keg.get("og")),
         "last_pour": _coerce_float(keg.get("last_pour")),
         "last_pour_string": keg.get("last_pour_string"),
-        "is_pouring": str(keg.get("is_pouring") or "0"),
+
+        # IMPORTANT: keep raw is_pouring for the binary_sensor
+        "is_pouring": keg.get("is_pouring"),
+
         "percent_of_beer_left": percent_left,
         "temperature_offset": _coerce_float(keg.get("temperature_offset")),
         "measure_unit": _coerce_int(keg.get("measure_unit")),
@@ -257,21 +239,21 @@ def _normalize_v2(keg: dict) -> dict:
         "empty_keg_weight": empty_keg_weight,
         "amount_left": amount_left,
         "unit": _coerce_int(keg.get("unit")),
-        # flattened internal fields (for sensors)
+
         "internal_ver": internal_ver,
         "internal_fw": internal_fw,
         "internal_dev": internal_dev,
         "internal_build": internal_build,
         "internal_tmpl": internal_tmpl,
         "internal_hbeat": internal_hbeat,
-        # numeric temps
+
         "keg_temperature_c": keg_temp,
         "chip_temperature_c": chip_temp,
-        # derived
+
         "liters_remaining": round(liters_remaining, 3) if isinstance(liters_remaining, float) else None,
         "beer_remaining_kg": round(beer_remaining_kg, 3) if isinstance(beer_remaining_kg, float) else None,
         "total_weight_kg": round(total_weight_kg, 3) if isinstance(total_weight_kg, float) else None,
-        # NEW: payload meta
+
         "my_beer_style": str(my_beer_style) if isinstance(my_beer_style, str) and my_beer_style.strip() else None,
         "my_keg_date": my_keg_date,
         "my_og": my_og,
@@ -303,9 +285,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "raw": {},
         "devices": [],
         ATTR_LAST_UPDATE: None,
-        # computed pour stats (per keg)
         "pour": {},
-        # manual per-keg meta (persisted)
         "meta": {},
         "meta_store": Store(hass, 1, f"{DOMAIN}_meta"),
     }
@@ -314,7 +294,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     base = _rest_base_from_ws(ws_url)
     session = async_get_clientsession(hass)
 
-    # ---- load persisted meta
     try:
         loaded = await state["meta_store"].async_load()
         if isinstance(loaded, dict):
@@ -391,20 +370,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         norm["daily_consumption_oz"] = float(p.get("daily_oz") or 0.0)
 
     def _apply_meta_and_expiration(keg_id: str, norm: dict) -> None:
-        """
-        expiration_date is computed as keg_date + 6 months.
-        keg_date comes from:
-          1) server my_keg_date (already normalized to MM/DD/YYYY in _normalize_v2)
-          2) manual kegged_date (service)
-        """
         meta = (state.get("meta") or {}).get(keg_id, {})
         manual_kegged = meta.get(ATTR_KEGGED_DATE)
 
-        # choose keg date source (prefer server date if present)
         keg_date = norm.get("my_keg_date") or (manual_kegged if isinstance(manual_kegged, str) else None)
 
-        # FIX: expose kegged_date sensor even if only server has it
-        norm[ATTR_KEGGED_DATE] = (manual_kegged if isinstance(manual_kegged, str) else norm.get("my_keg_date"))
+        norm[ATTR_KEGGED_DATE] = manual_kegged if isinstance(manual_kegged, str) else None
 
         exp = _calc_expiration_from_keg_date(keg_date)
         norm[ATTR_EXPIRATION_DATE] = exp
@@ -414,7 +385,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         for raw in payload_list:
             if not isinstance(raw, dict):
                 continue
-
             norm = _normalize_v2(raw)
             keg_id = norm["id"]
 
@@ -426,7 +396,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             state[ATTR_LAST_UPDATE] = datetime.now(timezone.utc)
             hass.bus.async_fire(PLATFORM_EVENT, {"keg_id": keg_id})
 
-        # keep devices list sane even if devices endpoint fails
         known = set(state.get("devices") or [])
         for kid in state["data"].keys():
             known.add(kid)
@@ -467,13 +436,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.warning("%s: WS disconnected (%s). Reconnecting...", DOMAIN, e)
                 await asyncio.sleep(WS_RECONNECT_DELAY)
 
-    # -------------------------
-    # Services: manual keg date
-    # -------------------------
     _SCHEMA_SET_DATES = vol.Schema(
         {
             vol.Required("id"): cv.string,
-            vol.Required("kegged_date"): cv.string,  # MM/DD/YYYY
+            vol.Required("kegged_date"): cv.string,
         }
     )
 
@@ -495,215 +461,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _apply_meta_and_expiration(keg_id, state["data"][keg_id])
             hass.bus.async_fire(PLATFORM_EVENT, {"keg_id": keg_id})
 
-        pn_create(hass, f"Keg date saved for {keg_id}. Expiration auto-calculated (+6 months).", title="Beer Keg Dates")
+        pn_create(
+            hass,
+            f"Keg date saved for {keg_id}. Expiration auto-calculated (+6 months).",
+            title="Beer Keg Dates",
+        )
 
     _register_service_once(hass, "set_keg_dates", set_keg_dates, schema=_SCHEMA_SET_DATES)
-
-    # -------------------------
-    # Services: Command API
-    # -------------------------
-    def _resolve_keg_id(call: ServiceCall) -> Optional[str]:
-        keg_id = call.data.get("id")
-        if keg_id:
-            return str(keg_id)
-
-        # FIX: prefer selected device from the select entity if present
-        selected = state.get("selected_device")
-        if selected:
-            return str(selected)
-
-        devices = state.get("devices") or []
-        return str(devices[0]) if devices else None
-
-    async def _post_cmd(keg_id: str, cmd: str, payload: dict | None = None) -> tuple[int, str]:
-        url = f"{base}/api/kegs/{keg_id}/{cmd}"
-        async with session.post(url, json=payload or {}) as resp:
-            txt = await resp.text()
-            return resp.status, txt
-
-    async def _get_connected() -> tuple[int, str]:
-        url = f"{base}/api/kegs/connected"
-        async with session.get(url) as resp:
-            txt = await resp.text()
-            return resp.status, txt
-
-    async def _notify(title: str, msg: str) -> None:
-        pn_create(hass, msg, title=title)
-
-    _SCHEMA_ID = vol.Schema({vol.Optional("id"): cv.string})
-    _SCHEMA_FLOAT = vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.Coerce(float)})
-    _SCHEMA_INT = vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.Coerce(int)})
-    _SCHEMA_STR = vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): cv.string})
-    _SCHEMA_GRAVITY = vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): cv.string})
-
-    async def cmd_tare(call: ServiceCall) -> None:
-        keg_id = _resolve_keg_id(call)
-        if not keg_id:
-            await _notify("Beer Keg Command", "No keg id available.")
-            return
-        status, body = await _post_cmd(keg_id, "tare")
-        await _notify("Beer Keg Command", f"tare ({keg_id}) -> {status}\n{body[:500]}")
-
-    async def cmd_empty_keg(call: ServiceCall) -> None:
-        keg_id = _resolve_keg_id(call)
-        if not keg_id:
-            await _notify("Beer Keg Command", "No keg id available.")
-            return
-        status, body = await _post_cmd(keg_id, "empty-keg", {"value": float(call.data["value"])})
-        await _notify("Beer Keg Command", f"empty-keg ({keg_id}) -> {status}\n{body[:500]}")
-
-    async def cmd_max_volume(call: ServiceCall) -> None:
-        keg_id = _resolve_keg_id(call)
-        if not keg_id:
-            await _notify("Beer Keg Command", "No keg id available.")
-            return
-        status, body = await _post_cmd(keg_id, "max-keg-volume", {"value": float(call.data["value"])})
-        await _notify("Beer Keg Command", f"max-keg-volume ({keg_id}) -> {status}\n{body[:500]}")
-
-    async def cmd_temp_offset(call: ServiceCall) -> None:
-        keg_id = _resolve_keg_id(call)
-        if not keg_id:
-            await _notify("Beer Keg Command", "No keg id available.")
-            return
-        status, body = await _post_cmd(keg_id, "temperature-offset", {"value": float(call.data["value"])})
-        await _notify("Beer Keg Command", f"temperature-offset ({keg_id}) -> {status}\n{body[:500]}")
-
-    async def cmd_calibrate_known(call: ServiceCall) -> None:
-        keg_id = _resolve_keg_id(call)
-        if not keg_id:
-            await _notify("Beer Keg Command", "No keg id available.")
-            return
-        status, body = await _post_cmd(keg_id, "calibrate-known-weight", {"value": float(call.data["value"])})
-        await _notify("Beer Keg Command", f"calibrate-known-weight ({keg_id}) -> {status}\n{body[:500]}")
-
-    async def cmd_beer_style(call: ServiceCall) -> None:
-        keg_id = _resolve_keg_id(call)
-        if not keg_id:
-            await _notify("Beer Keg Command", "No keg id available.")
-            return
-        status, body = await _post_cmd(keg_id, "beer-style", {"value": str(call.data["value"])})
-        await _notify("Beer Keg Command", f"beer-style ({keg_id}) -> {status}\n{body[:500]}")
-
-    async def cmd_date(call: ServiceCall) -> None:
-        keg_id = _resolve_keg_id(call)
-        if not keg_id:
-            await _notify("Beer Keg Command", "No keg id available.")
-            return
-        status, body = await _post_cmd(keg_id, "date", {"value": str(call.data["value"])})
-        await _notify("Beer Keg Command", f"date ({keg_id}) -> {status}\n{body[:500]}")
-
-    async def cmd_unit(call: ServiceCall) -> None:
-        keg_id = _resolve_keg_id(call)
-        if not keg_id:
-            await _notify("Beer Keg Command", "No keg id available.")
-            return
-        val = str(call.data["value"]).lower()
-        if val not in ("metric", "us"):
-            await _notify("Beer Keg Command", "unit value must be metric or us")
-            return
-        status, body = await _post_cmd(keg_id, "unit", {"value": val})
-        await _notify("Beer Keg Command", f"unit ({keg_id}) -> {status}\n{body[:500]}")
-
-    async def cmd_measure_unit(call: ServiceCall) -> None:
-        keg_id = _resolve_keg_id(call)
-        if not keg_id:
-            await _notify("Beer Keg Command", "No keg id available.")
-            return
-        val = str(call.data["value"]).lower()
-        if val not in ("weight", "volume"):
-            await _notify("Beer Keg Command", "measure-unit value must be weight or volume")
-            return
-        status, body = await _post_cmd(keg_id, "measure-unit", {"value": val})
-        await _notify("Beer Keg Command", f"measure-unit ({keg_id}) -> {status}\n{body[:500]}")
-
-    async def cmd_keg_mode(call: ServiceCall) -> None:
-        keg_id = _resolve_keg_id(call)
-        if not keg_id:
-            await _notify("Beer Keg Command", "No keg id available.")
-            return
-        val = str(call.data["value"]).lower()
-        if val not in ("beer", "co2"):
-            await _notify("Beer Keg Command", "keg-mode value must be beer or co2")
-            return
-        status, body = await _post_cmd(keg_id, "keg-mode", {"value": val})
-        await _notify("Beer Keg Command", f"keg-mode ({keg_id}) -> {status}\n{body[:500]}")
-
-    async def cmd_sensitivity(call: ServiceCall) -> None:
-        keg_id = _resolve_keg_id(call)
-        if not keg_id:
-            await _notify("Beer Keg Command", "No keg id available.")
-            return
-        status, body = await _post_cmd(keg_id, "sensitivity", {"value": int(call.data["value"])})
-        await _notify("Beer Keg Command", f"sensitivity ({keg_id}) -> {status}\n{body[:500]}")
-
-    async def get_connected(call: ServiceCall) -> None:
-        status, body = await _get_connected()
-        await _notify("Beer Keg Connected", f"connected -> {status}\n{body[:1000]}")
-
-    # NEW: OG/FG/ABV endpoints
-    async def cmd_set_og(call: ServiceCall) -> None:
-        keg_id = _resolve_keg_id(call)
-        if not keg_id:
-            await _notify("Beer Keg Command", "No keg id available.")
-            return
-        g = _coerce_gravity_1xxx(call.data["value"])
-        if g is None:
-            await _notify("Beer Keg Command", "OG must be in format 1.xxx (ex: 1.050)")
-            return
-        status, body = await _post_cmd(keg_id, "og", {"value": g})
-        await _notify("Beer Keg Command", f"og ({keg_id}) -> {status}\n{body[:500]}")
-
-    async def cmd_set_fg(call: ServiceCall) -> None:
-        keg_id = _resolve_keg_id(call)
-        if not keg_id:
-            await _notify("Beer Keg Command", "No keg id available.")
-            return
-        g = _coerce_gravity_1xxx(call.data["value"])
-        if g is None:
-            await _notify("Beer Keg Command", "FG must be in format 1.xxx (ex: 1.010)")
-            return
-        status, body = await _post_cmd(keg_id, "fg", {"value": g})
-        await _notify("Beer Keg Command", f"fg ({keg_id}) -> {status}\n{body[:500]}")
-
-    async def cmd_calc_abv(call: ServiceCall) -> None:
-        keg_id = _resolve_keg_id(call)
-        if not keg_id:
-            await _notify("Beer Keg Command", "No keg id available.")
-            return
-        status, body = await _post_cmd(keg_id, "abv")
-        await _notify("Beer Keg Command", f"abv ({keg_id}) -> {status}\n{body[:500]}")
-
-    _register_service_once(hass, "keg_tare", cmd_tare, schema=_SCHEMA_ID)
-    _register_service_once(hass, "keg_set_empty_keg_weight", cmd_empty_keg, schema=_SCHEMA_FLOAT)
-    _register_service_once(hass, "keg_set_max_keg_volume", cmd_max_volume, schema=_SCHEMA_FLOAT)
-    _register_service_once(hass, "keg_set_temperature_offset", cmd_temp_offset, schema=_SCHEMA_FLOAT)
-    _register_service_once(hass, "keg_calibrate_known_weight", cmd_calibrate_known, schema=_SCHEMA_FLOAT)
-    _register_service_once(hass, "keg_set_beer_style", cmd_beer_style, schema=_SCHEMA_STR)
-    _register_service_once(hass, "keg_set_date", cmd_date, schema=_SCHEMA_STR)
-    _register_service_once(
-        hass,
-        "keg_set_unit_system",
-        cmd_unit,
-        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.In(["metric", "us"])}),
-    )
-    _register_service_once(
-        hass,
-        "keg_set_measure_unit",
-        cmd_measure_unit,
-        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.In(["weight", "volume"])}),
-    )
-    _register_service_once(
-        hass,
-        "keg_set_mode",
-        cmd_keg_mode,
-        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.In(["beer", "co2"])}),
-    )
-    _register_service_once(hass, "keg_set_sensitivity", cmd_sensitivity, schema=_SCHEMA_INT)
-    _register_service_once(hass, "keg_get_connected", get_connected, schema=vol.Schema({}))
-
-    _register_service_once(hass, "keg_set_og", cmd_set_og, schema=_SCHEMA_GRAVITY)
-    _register_service_once(hass, "keg_set_fg", cmd_set_fg, schema=_SCHEMA_GRAVITY)
-    _register_service_once(hass, "keg_calc_abv", cmd_calc_abv, schema=_SCHEMA_ID)
 
     async def on_stop(_event) -> None:
         try:
