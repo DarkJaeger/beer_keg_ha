@@ -18,6 +18,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def _is_truthy(v: Any) -> bool:
+    """Normalize is_pouring from server into a boolean."""
     if v is None:
         return False
     if isinstance(v, bool):
@@ -25,7 +26,8 @@ def _is_truthy(v: Any) -> bool:
     if isinstance(v, (int, float)):
         return v != 0
     if isinstance(v, str):
-        return v.strip().lower() in ("1", "true", "on", "yes", "y")
+        s = v.strip().lower()
+        return s in ("1", "true", "on", "yes", "y", "pouring")
     return False
 
 
@@ -40,7 +42,7 @@ async def async_setup_entry(
     def create_for(keg_id: str) -> None:
         if keg_id in created:
             return
-        async_add_entities([KegPouringBinarySensor(entry, keg_id, state)], True)
+        async_add_entities([KegPouringBinarySensor(hass, entry, keg_id)], True)
         created.add(keg_id)
 
     for keg_id in list(state.get("data", {}).keys()):
@@ -56,15 +58,16 @@ async def async_setup_entry(
 
 
 class KegPouringBinarySensor(BinarySensorEntity):
-    """ON while keg is actively pouring (live WS field is_pouring)."""
+    """ON while keg is actively pouring (WS field is_pouring)."""
 
     _attr_should_poll = False
     _attr_device_class = BinarySensorDeviceClass.RUNNING
 
-    def __init__(self, entry: ConfigEntry, keg_id: str, state_ref: Dict[str, Any]) -> None:
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, keg_id: str) -> None:
+        self.hass = hass
         self.entry = entry
         self.keg_id = keg_id
-        self._state_ref = state_ref
+        self._state_ref: Dict[str, Any] = hass.data[DOMAIN][entry.entry_id]
 
         short_id = keg_id[:4]
         self._attr_name = f"Keg {short_id} Pouring"
@@ -92,9 +95,7 @@ class KegPouringBinarySensor(BinarySensorEntity):
         return "mdi:circle" if self.is_on else "mdi:circle-outline"
 
     async def async_added_to_hass(self) -> None:
-        self.async_on_remove(
-            self.hass.bus.async_listen(PLATFORM_EVENT, self._refresh_if_mine)
-        )
+        self.async_on_remove(self.hass.bus.async_listen(PLATFORM_EVENT, self._refresh_if_mine))
 
     @callback
     def _refresh_if_mine(self, event) -> None:

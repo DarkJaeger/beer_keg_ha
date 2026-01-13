@@ -406,43 +406,41 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         norm[ATTR_EXPIRATION_DATE] = exp
         norm[ATTR_DAYS_UNTIL_EXPIRATION] = _days_until(exp) if exp else None
 
-    async def publish_kegs(payload_list: List[dict]) -> None:
+    async def publish_kegs(payload_list: List[dict], *, source: str) -> None:
         for raw in payload_list:
             if not isinstance(raw, dict):
                 continue
             norm = _normalize_v2(raw)
             keg_id = norm["id"]
 
+            # ✅ Preserve live pouring state: REST often reports "0" even when pouring.
+            if source == "rest":
+                prev = state.get("data", {}).get(keg_id, {})
+                if prev:
+                    norm["is_pouring"] = prev.get("is_pouring")
+
             _update_pour_stats(keg_id, norm)
             _apply_meta_and_expiration(keg_id, norm)
-
-            # ✅ log WS is_pouring changes at INFO so you can see it without YAML changes
-            if "is_pouring" in raw:
-                prev = state["_last_is_pouring"].get(keg_id)
-                curr = raw.get("is_pouring")
-                if prev != curr:
-                    state["_last_is_pouring"][keg_id] = curr
-                    _LOGGER.info("%s: is_pouring change id=%s is_pouring=%r", DOMAIN, keg_id, curr)
 
             state["raw"][keg_id] = raw
             state["data"][keg_id] = norm
             state[ATTR_LAST_UPDATE] = datetime.now(timezone.utc)
             hass.bus.async_fire(PLATFORM_EVENT, {"keg_id": keg_id})
 
-            # ---- devices list (stable + only fire event when actually changed)
-            known = set(state.get("devices") or [])
-            known.update(state["data"].keys())
+        # ✅ Stable device list + only fire if changed (prevents select capability spam)
+        known = set(state.get("devices") or [])
+        known.update(state["data"].keys())
+        new_devices = sorted(known)
+        if new_devices != (state.get("devices") or []):
+            state["devices"] = new_devices
+            hass.bus.async_fire(DEVICES_UPDATE_EVENT, {"ids": new_devices})
 
-            new_devices = sorted(known)  # ✅ stable order
-            if new_devices != (state.get("devices") or []):
-                state["devices"] = new_devices
-                hass.bus.async_fire(DEVICES_UPDATE_EVENT, {"ids": new_devices})
 
 
     async def rest_poll(_now=None) -> None:
         try:
             kegs = await fetch_kegs_rest()
-            await publish_kegs(kegs)
+            await publish_kegs(kegs, source="rest")
         except Exception as e:
             _LOGGER.debug("%s: REST poll failed: %s", DOMAIN, e)
 
@@ -466,14 +464,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
                         # ✅ FIX: server can send a SINGLE keg object (page uses this)
                         if isinstance(data, dict) and data.get("id"):
-                            await publish_kegs([data])
+                            await publish_kegs([data], source="ws")
                             continue
 
                         # existing support
                         if isinstance(data, list):
-                            await publish_kegs(data)
+                            await publish_kegs(data, source="ws")
                         elif isinstance(data, dict) and isinstance(data.get("kegs"), list):
-                            await publish_kegs(data["kegs"])
+                            await publish_kegs(data["kegs"], source="ws")
 
             except Exception as e:
                 _LOGGER.warning("%s: WS disconnected (%s). Reconnecting...", DOMAIN, e)
