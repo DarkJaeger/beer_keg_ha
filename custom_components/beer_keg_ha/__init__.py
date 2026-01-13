@@ -1,6 +1,9 @@
+# __init__.py (drop-in replacement with fixes)
+
 from __future__ import annotations
 
 import asyncio
+import calendar
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -89,7 +92,8 @@ def _parse_date_flexible(s: Any) -> Optional[datetime]:
     """
     Accept:
       - MM/DD/YYYY (DATE_FORMAT)
-      - MM.DD.YYYY  (your payload example)
+      - MM.DD.YYYY  (payload example)
+      - MM-DD-YYYY
       - YYYY-MM-DD
     Return UTC aware at 00:00:00.
     """
@@ -97,12 +101,10 @@ def _parse_date_flexible(s: Any) -> Optional[datetime]:
         return None
     s = s.strip()
 
-    # Try MM/DD/YYYY
     dt = _parse_mmddyyyy(s)
     if dt:
         return dt
 
-    # Try MM.DD.YYYY
     for fmt in ("%m.%d.%Y", "%m-%d-%Y", "%Y-%m-%d"):
         try:
             dt2 = datetime.strptime(s, fmt)
@@ -146,6 +148,27 @@ def _coerce_gravity_1xxx(v: Any) -> float | None:
     if f < 0.9 or f > 1.2:
         return None
     return f
+
+
+def _add_months(dt: datetime, months: int) -> datetime:
+    """Add months to dt, clamping day to last day of target month."""
+    y = dt.year + (dt.month - 1 + months) // 12
+    m = (dt.month - 1 + months) % 12 + 1
+    last_day = calendar.monthrange(y, m)[1]
+    d = min(dt.day, last_day)
+    return dt.replace(year=y, month=m, day=d)
+
+
+def _calc_expiration_from_keg_date(keg_date_str: Any) -> Optional[str]:
+    """
+    Given a keg date string (flexible formats), compute expiration = +6 months
+    and return as MM/DD/YYYY.
+    """
+    dt = _parse_date_flexible(keg_date_str)
+    if not dt:
+        return None
+    exp = _add_months(dt, 6)
+    return _format_mmddyyyy(exp)
 
 
 def _normalize_v2(keg: dict) -> dict:
@@ -211,7 +234,6 @@ def _normalize_v2(keg: dict) -> dict:
     return {
         "id": keg_id,
         "short_id": short_id,
-
         # raw fields (as sensors)
         "firmware_version": keg.get("firmware_version"),
         "chip_temperature_string": keg.get("chip_temperature_string"),
@@ -235,7 +257,6 @@ def _normalize_v2(keg: dict) -> dict:
         "empty_keg_weight": empty_keg_weight,
         "amount_left": amount_left,
         "unit": _coerce_int(keg.get("unit")),
-
         # flattened internal fields (for sensors)
         "internal_ver": internal_ver,
         "internal_fw": internal_fw,
@@ -243,16 +264,13 @@ def _normalize_v2(keg: dict) -> dict:
         "internal_build": internal_build,
         "internal_tmpl": internal_tmpl,
         "internal_hbeat": internal_hbeat,
-
         # numeric temps
         "keg_temperature_c": keg_temp,
         "chip_temperature_c": chip_temp,
-
         # derived
         "liters_remaining": round(liters_remaining, 3) if isinstance(liters_remaining, float) else None,
         "beer_remaining_kg": round(beer_remaining_kg, 3) if isinstance(beer_remaining_kg, float) else None,
         "total_weight_kg": round(total_weight_kg, 3) if isinstance(total_weight_kg, float) else None,
-
         # NEW: payload meta
         "my_beer_style": str(my_beer_style) if isinstance(my_beer_style, str) and my_beer_style.strip() else None,
         "my_keg_date": my_keg_date,
@@ -285,10 +303,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "raw": {},
         "devices": [],
         ATTR_LAST_UPDATE: None,
-
         # computed pour stats (per keg)
         "pour": {},
-
         # manual per-keg meta (persisted)
         "meta": {},
         "meta_store": Store(hass, 1, f"{DOMAIN}_meta"),
@@ -376,21 +392,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     def _apply_meta_and_expiration(keg_id: str, norm: dict) -> None:
         """
-        Manual meta (kegged/expiration) is still supported.
-        If the server now provides my_keg_date, we DO NOT overwrite it here.
+        expiration_date is computed as keg_date + 6 months.
+        keg_date comes from:
+          1) server my_keg_date (already normalized to MM/DD/YYYY in _normalize_v2)
+          2) manual kegged_date (service)
         """
         meta = (state.get("meta") or {}).get(keg_id, {})
-        kegged = meta.get(ATTR_KEGGED_DATE)
-        exp = meta.get(ATTR_EXPIRATION_DATE)
+        manual_kegged = meta.get(ATTR_KEGGED_DATE)
 
-        norm[ATTR_KEGGED_DATE] = kegged if isinstance(kegged, str) else None
-        norm[ATTR_EXPIRATION_DATE] = exp if isinstance(exp, str) else None
+        # choose keg date source (prefer server date if present)
+        keg_date = norm.get("my_keg_date") or (manual_kegged if isinstance(manual_kegged, str) else None)
+
+        # FIX: expose kegged_date sensor even if only server has it
+        norm[ATTR_KEGGED_DATE] = (manual_kegged if isinstance(manual_kegged, str) else norm.get("my_keg_date"))
+
+        exp = _calc_expiration_from_keg_date(keg_date)
+        norm[ATTR_EXPIRATION_DATE] = exp
         norm[ATTR_DAYS_UNTIL_EXPIRATION] = _days_until(exp) if exp else None
 
     async def publish_kegs(payload_list: List[dict]) -> None:
         for raw in payload_list:
             if not isinstance(raw, dict):
                 continue
+
             norm = _normalize_v2(raw)
             keg_id = norm["id"]
 
@@ -402,6 +426,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             state[ATTR_LAST_UPDATE] = datetime.now(timezone.utc)
             hass.bus.async_fire(PLATFORM_EVENT, {"keg_id": keg_id})
 
+        # keep devices list sane even if devices endpoint fails
         known = set(state.get("devices") or [])
         for kid in state["data"].keys():
             known.add(kid)
@@ -443,34 +468,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 await asyncio.sleep(WS_RECONNECT_DELAY)
 
     # -------------------------
-    # Services: manual dates
+    # Services: manual keg date
     # -------------------------
     _SCHEMA_SET_DATES = vol.Schema(
         {
             vol.Required("id"): cv.string,
-            vol.Optional("kegged_date"): cv.string,      # MM/DD/YYYY
-            vol.Optional("expiration_date"): cv.string,  # MM/DD/YYYY
+            vol.Required("kegged_date"): cv.string,  # MM/DD/YYYY
         }
     )
 
     async def set_keg_dates(call: ServiceCall) -> None:
         keg_id = str(call.data["id"])
         kegged = call.data.get("kegged_date")
-        exp = call.data.get("expiration_date")
 
-        if kegged is not None and _parse_mmddyyyy(kegged) is None:
+        if _parse_mmddyyyy(kegged) is None:
             pn_create(hass, f"Invalid kegged_date. Use {DATE_FORMAT} (MM/DD/YYYY).", title="Beer Keg Dates")
-            return
-        if exp is not None and _parse_mmddyyyy(exp) is None:
-            pn_create(hass, f"Invalid expiration_date. Use {DATE_FORMAT} (MM/DD/YYYY).", title="Beer Keg Dates")
             return
 
         meta = state.setdefault("meta", {})
         meta.setdefault(keg_id, {})
-        if kegged is not None:
-            meta[keg_id][ATTR_KEGGED_DATE] = kegged
-        if exp is not None:
-            meta[keg_id][ATTR_EXPIRATION_DATE] = exp
+        meta[keg_id][ATTR_KEGGED_DATE] = kegged
 
         await state["meta_store"].async_save(meta)
 
@@ -478,7 +495,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _apply_meta_and_expiration(keg_id, state["data"][keg_id])
             hass.bus.async_fire(PLATFORM_EVENT, {"keg_id": keg_id})
 
-        pn_create(hass, f"Dates saved for {keg_id}", title="Beer Keg Dates")
+        pn_create(hass, f"Keg date saved for {keg_id}. Expiration auto-calculated (+6 months).", title="Beer Keg Dates")
 
     _register_service_once(hass, "set_keg_dates", set_keg_dates, schema=_SCHEMA_SET_DATES)
 
@@ -489,6 +506,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         keg_id = call.data.get("id")
         if keg_id:
             return str(keg_id)
+
+        # FIX: prefer selected device from the select entity if present
+        selected = state.get("selected_device")
+        if selected:
+            return str(selected)
+
         devices = state.get("devices") or []
         return str(devices[0]) if devices else None
 
@@ -678,7 +701,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _register_service_once(hass, "keg_set_sensitivity", cmd_sensitivity, schema=_SCHEMA_INT)
     _register_service_once(hass, "keg_get_connected", get_connected, schema=vol.Schema({}))
 
-    # NEW service registrations
     _register_service_once(hass, "keg_set_og", cmd_set_og, schema=_SCHEMA_GRAVITY)
     _register_service_once(hass, "keg_set_fg", cmd_set_fg, schema=_SCHEMA_GRAVITY)
     _register_service_once(hass, "keg_calc_abv", cmd_calc_abv, schema=_SCHEMA_ID)
