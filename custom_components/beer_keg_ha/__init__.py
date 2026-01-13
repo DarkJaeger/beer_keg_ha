@@ -33,7 +33,7 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# ✅ ADDED binary_sensor
+# ✅ IMPORTANT: include binary_sensor so pouring dot loads
 PLATFORMS = ["sensor", "select", "binary_sensor"]
 
 REST_POLL_SECONDS = 10
@@ -213,7 +213,6 @@ def _normalize_v2(keg: dict) -> dict:
     return {
         "id": keg_id,
         "short_id": short_id,
-
         "firmware_version": keg.get("firmware_version"),
         "chip_temperature_string": keg.get("chip_temperature_string"),
         "max_temperature": _coerce_float(keg.get("max_temperature")),
@@ -228,10 +227,8 @@ def _normalize_v2(keg: dict) -> dict:
         "og": _coerce_int(keg.get("og")),
         "last_pour": _coerce_float(keg.get("last_pour")),
         "last_pour_string": keg.get("last_pour_string"),
-
-        # IMPORTANT: keep raw is_pouring for the binary_sensor
+        # ✅ keep raw server value (often "0"/"1")
         "is_pouring": keg.get("is_pouring"),
-
         "percent_of_beer_left": percent_left,
         "temperature_offset": _coerce_float(keg.get("temperature_offset")),
         "measure_unit": _coerce_int(keg.get("measure_unit")),
@@ -254,7 +251,7 @@ def _normalize_v2(keg: dict) -> dict:
         "beer_remaining_kg": round(beer_remaining_kg, 3) if isinstance(beer_remaining_kg, float) else None,
         "total_weight_kg": round(total_weight_kg, 3) if isinstance(total_weight_kg, float) else None,
 
-        "my_beer_style": str(my_beer_style) if isinstance(my_beer_style, str) and my_beer_style.strip() else None,
+        "my_beer_style": str(my_beer_style).strip() if isinstance(my_beer_style, str) and my_beer_style.strip() else None,
         "my_keg_date": my_keg_date,
         "my_og": my_og,
         "my_fg": my_fg,
@@ -339,7 +336,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         p = state["pour"].get(keg_id)
 
         if not p:
-            p = state["pour"][keg_id] = {
+            state["pour"][keg_id] = {
                 "last_total_kg": float(total_kg),
                 "last_pour_oz": 0.0,
                 "daily_oz": 0.0,
@@ -361,8 +358,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             oz = round(delta_kg * KG_TO_OZ, 1)
             p["last_pour_oz"] = oz
             p["daily_oz"] = round(float(p.get("daily_oz") or 0.0) + oz, 1)
-        else:
-            p["last_pour_oz"] = float(p.get("last_pour_oz") or 0.0)
 
         p["last_total_kg"] = curr
 
@@ -397,8 +392,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.bus.async_fire(PLATFORM_EVENT, {"keg_id": keg_id})
 
         known = set(state.get("devices") or [])
-        for kid in state["data"].keys():
-            known.add(kid)
+        known.update(state["data"].keys())
         state["devices"] = list(known)
         hass.bus.async_fire(DEVICES_UPDATE_EVENT, {"ids": list(known)})
 
@@ -427,6 +421,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         except Exception:
                             continue
 
+                        # ✅ FIX: support server sending a SINGLE keg object
+                        if isinstance(data, dict) and data.get("id"):
+                            await publish_kegs([data])
+                            continue
+
+                        # existing support
                         if isinstance(data, list):
                             await publish_kegs(data)
                         elif isinstance(data, dict) and isinstance(data.get("kegs"), list):
@@ -436,11 +436,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.warning("%s: WS disconnected (%s). Reconnecting...", DOMAIN, e)
                 await asyncio.sleep(WS_RECONNECT_DELAY)
 
+    # Services: manual keg date (expiration auto +6 months)
     _SCHEMA_SET_DATES = vol.Schema(
-        {
-            vol.Required("id"): cv.string,
-            vol.Required("kegged_date"): cv.string,
-        }
+        {vol.Required("id"): cv.string, vol.Required("kegged_date"): cv.string}
     )
 
     async def set_keg_dates(call: ServiceCall) -> None:
@@ -461,11 +459,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _apply_meta_and_expiration(keg_id, state["data"][keg_id])
             hass.bus.async_fire(PLATFORM_EVENT, {"keg_id": keg_id})
 
-        pn_create(
-            hass,
-            f"Keg date saved for {keg_id}. Expiration auto-calculated (+6 months).",
-            title="Beer Keg Dates",
-        )
+        pn_create(hass, f"Keg date saved for {keg_id}. Expiration auto-calculated (+6 months).", title="Beer Keg Dates")
 
     _register_service_once(hass, "set_keg_dates", set_keg_dates, schema=_SCHEMA_SET_DATES)
 
