@@ -60,7 +60,6 @@ class KegPouringBinarySensor(BinarySensorEntity):
 
     _attr_should_poll = False
     _attr_device_class = BinarySensorDeviceClass.RUNNING
-    _attr_icon = "mdi:circle"  # shows as a dot; green when ON
 
     def __init__(self, entry: ConfigEntry, keg_id: str, state_ref: Dict[str, Any]) -> None:
         self.entry = entry
@@ -86,6 +85,11 @@ class KegPouringBinarySensor(BinarySensorEntity):
         data: Dict[str, Dict[str, Any]] = self._state_ref.get("data", {})
         v = data.get(self.keg_id, {}).get("is_pouring")
         return _is_truthy(v)
+
+    @property
+    def icon(self) -> str:
+        # Filled dot when ON, outline when OFF
+        return "mdi:circle" if self.is_on else "mdi:circle-outline"
 
     async def async_added_to_hass(self) -> None:
         self.async_on_remove(
