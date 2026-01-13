@@ -330,10 +330,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     return state.get("devices", [])
                 data = await resp.json()
                 if isinstance(data, list):
-                    ids = [str(x) for x in data]
-                    state["devices"] = ids
-                    hass.bus.async_fire(DEVICES_UPDATE_EVENT, {"ids": ids})
-                    return ids
+                    ids = sorted({str(x) for x in data if x not in (None, "", "unknown", "unavailable")})
+                    if ids != (state.get("devices") or []):
+                        state["devices"] = ids
+                        hass.bus.async_fire(DEVICES_UPDATE_EVENT, {"ids": ids})
+                    return state.get("devices", [])
+
         except Exception:
             pass
         return state.get("devices", [])
@@ -427,10 +429,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             state[ATTR_LAST_UPDATE] = datetime.now(timezone.utc)
             hass.bus.async_fire(PLATFORM_EVENT, {"keg_id": keg_id})
 
-        known = set(state.get("devices") or [])
-        known.update(state["data"].keys())
-        state["devices"] = list(known)
-        hass.bus.async_fire(DEVICES_UPDATE_EVENT, {"ids": list(known)})
+            # ---- devices list (stable + only fire event when actually changed)
+            known = set(state.get("devices") or [])
+            known.update(state["data"].keys())
+
+            new_devices = sorted(known)  # ✅ stable order
+            if new_devices != (state.get("devices") or []):
+                state["devices"] = new_devices
+                hass.bus.async_fire(DEVICES_UPDATE_EVENT, {"ids": new_devices})
+
 
     async def rest_poll(_now=None) -> None:
         try:
