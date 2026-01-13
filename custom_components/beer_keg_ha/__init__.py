@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import json
 import logging
-import calendar
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, urlunparse
@@ -44,6 +44,27 @@ KG_TO_OZ = 35.274
 
 DEFAULT_BEER_SG = 1.010
 WATER_DENSITY_KG_PER_L = 0.998
+
+
+def _normalize_ws_url(ws_url: str) -> str:
+    """
+    Server page connects to WebSocket('/ws').
+    Users sometimes enter ws://host:port (no /ws) in config.
+    Fix that here so WS actually receives live is_pouring updates.
+    """
+    u = urlparse(ws_url)
+    path = u.path or ""
+    if path in ("", "/"):
+        u = u._replace(path="/ws")
+        return urlunparse(u)
+    # If someone pasted http(s) URL, convert it to ws(s)
+    if u.scheme in ("http", "https"):
+        scheme = "ws" if u.scheme == "http" else "wss"
+        u = u._replace(scheme=scheme)
+        if u.path in ("", "/"):
+            u = u._replace(path="/ws")
+        return urlunparse(u)
+    return ws_url
 
 
 def _rest_base_from_ws(ws: str) -> str:
@@ -227,7 +248,7 @@ def _normalize_v2(keg: dict) -> dict:
         "og": _coerce_int(keg.get("og")),
         "last_pour": _coerce_float(keg.get("last_pour")),
         "last_pour_string": keg.get("last_pour_string"),
-        # ✅ keep raw server value (often "0"/"1")
+        # ✅ keep raw server value (often "0"/"1") AND WS boolean sometimes
         "is_pouring": keg.get("is_pouring"),
         "percent_of_beer_left": percent_left,
         "temperature_offset": _coerce_float(keg.get("temperature_offset")),
@@ -236,22 +257,20 @@ def _normalize_v2(keg: dict) -> dict:
         "empty_keg_weight": empty_keg_weight,
         "amount_left": amount_left,
         "unit": _coerce_int(keg.get("unit")),
-
         "internal_ver": internal_ver,
         "internal_fw": internal_fw,
         "internal_dev": internal_dev,
         "internal_build": internal_build,
         "internal_tmpl": internal_tmpl,
         "internal_hbeat": internal_hbeat,
-
         "keg_temperature_c": keg_temp,
         "chip_temperature_c": chip_temp,
-
         "liters_remaining": round(liters_remaining, 3) if isinstance(liters_remaining, float) else None,
         "beer_remaining_kg": round(beer_remaining_kg, 3) if isinstance(beer_remaining_kg, float) else None,
         "total_weight_kg": round(total_weight_kg, 3) if isinstance(total_weight_kg, float) else None,
-
-        "my_beer_style": str(my_beer_style).strip() if isinstance(my_beer_style, str) and my_beer_style.strip() else None,
+        "my_beer_style": str(my_beer_style).strip()
+        if isinstance(my_beer_style, str) and my_beer_style.strip()
+        else None,
         "my_keg_date": my_keg_date,
         "my_og": my_og,
         "my_fg": my_fg,
@@ -275,6 +294,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.error("%s: Missing ws_url", DOMAIN)
         return False
 
+    # ✅ ensure /ws is present so is_pouring can update live
+    ws_url = _normalize_ws_url(ws_url)
+
     hass.data.setdefault(DOMAIN, {})
     state: Dict[str, Any] = {
         "ws_url": ws_url,
@@ -285,6 +307,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "pour": {},
         "meta": {},
         "meta_store": Store(hass, 1, f"{DOMAIN}_meta"),
+        # track WS is_pouring changes (for easy troubleshooting)
+        "_last_is_pouring": {},
     }
     hass.data[DOMAIN][entry.entry_id] = state
 
@@ -368,10 +392,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         meta = (state.get("meta") or {}).get(keg_id, {})
         manual_kegged = meta.get(ATTR_KEGGED_DATE)
 
-        keg_date = norm.get("my_keg_date") or (manual_kegged if isinstance(manual_kegged, str) else None)
+        keg_date = norm.get("my_keg_date") or (
+            manual_kegged if isinstance(manual_kegged, str) else None
+        )
 
+        # show manual date (if you set it)
         norm[ATTR_KEGGED_DATE] = manual_kegged if isinstance(manual_kegged, str) else None
 
+        # expiration = keg date + 6 months (computed)
         exp = _calc_expiration_from_keg_date(keg_date)
         norm[ATTR_EXPIRATION_DATE] = exp
         norm[ATTR_DAYS_UNTIL_EXPIRATION] = _days_until(exp) if exp else None
@@ -385,6 +413,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             _update_pour_stats(keg_id, norm)
             _apply_meta_and_expiration(keg_id, norm)
+
+            # ✅ log WS is_pouring changes at INFO so you can see it without YAML changes
+            if "is_pouring" in raw:
+                prev = state["_last_is_pouring"].get(keg_id)
+                curr = raw.get("is_pouring")
+                if prev != curr:
+                    state["_last_is_pouring"][keg_id] = curr
+                    _LOGGER.info("%s: is_pouring change id=%s is_pouring=%r", DOMAIN, keg_id, curr)
 
             state["raw"][keg_id] = raw
             state["data"][keg_id] = norm
@@ -421,7 +457,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         except Exception:
                             continue
 
-                        # ✅ FIX: support server sending a SINGLE keg object
+                        # ✅ FIX: server can send a SINGLE keg object (page uses this)
                         if isinstance(data, dict) and data.get("id"):
                             await publish_kegs([data])
                             continue
@@ -437,16 +473,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 await asyncio.sleep(WS_RECONNECT_DELAY)
 
     # Services: manual keg date (expiration auto +6 months)
-    _SCHEMA_SET_DATES = vol.Schema(
-        {vol.Required("id"): cv.string, vol.Required("kegged_date"): cv.string}
-    )
+    _SCHEMA_SET_DATES = vol.Schema({vol.Required("id"): cv.string, vol.Required("kegged_date"): cv.string})
 
     async def set_keg_dates(call: ServiceCall) -> None:
         keg_id = str(call.data["id"])
         kegged = call.data.get("kegged_date")
 
         if _parse_mmddyyyy(kegged) is None:
-            pn_create(hass, f"Invalid kegged_date. Use {DATE_FORMAT} (MM/DD/YYYY).", title="Beer Keg Dates")
+            pn_create(
+                hass,
+                f"Invalid kegged_date. Use {DATE_FORMAT} (MM/DD/YYYY).",
+                title="Beer Keg Dates",
+            )
             return
 
         meta = state.setdefault("meta", {})
@@ -459,7 +497,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _apply_meta_and_expiration(keg_id, state["data"][keg_id])
             hass.bus.async_fire(PLATFORM_EVENT, {"keg_id": keg_id})
 
-        pn_create(hass, f"Keg date saved for {keg_id}. Expiration auto-calculated (+6 months).", title="Beer Keg Dates")
+        pn_create(
+            hass,
+            f"Keg date saved for {keg_id}. Expiration auto-calculated (+6 months).",
+            title="Beer Keg Dates",
+        )
 
     _register_service_once(hass, "set_keg_dates", set_keg_dates, schema=_SCHEMA_SET_DATES)
 
