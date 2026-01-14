@@ -538,7 +538,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    """Unload a config entry."""
+    # If setup never completed, platforms were never loaded.
+    # In that case, async_unload_platforms can raise "Config entry was never loaded!"
+    try:
+        unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    except ValueError as e:
+        if "Config entry was never loaded" in str(e):
+            unloaded = True
+        else:
+            raise
+
     if unloaded:
         hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     return unloaded
+
