@@ -21,6 +21,8 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+OZ_TO_ML = 29.5735295625  # US fl oz -> mL
+
 SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
     # -------------------------
     # Computed (derived)
@@ -29,8 +31,9 @@ SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
     "beer_remaining_kg": {"name": "Beer Remaining", "key": "beer_remaining_kg", "icon": "mdi:beer", "device_class": "weight", "state_class": "measurement", "unit": "kg", "round": 3},
     "liters_remaining": {"name": "Beer Remaining", "key": "liters_remaining", "icon": "mdi:cup", "device_class": "volume", "state_class": None, "unit": "L", "round": 3},
 
-    "last_pour_oz": {"name": "Last Pour", "key": "last_pour_oz", "icon": "mdi:cup-water", "device_class": None, "state_class": "measurement", "unit": "oz", "round": 1},
-    "daily_consumption_oz": {"name": "Daily Consumption", "key": "daily_consumption_oz", "icon": "mdi:beer", "device_class": None, "state_class": "measurement", "unit": "oz", "round": 1},
+    # NOTE: unit is dynamic for these two (oz <-> ml)
+    "last_pour_oz": {"name": "Last Pour", "key": "last_pour_oz", "icon": "mdi:cup-water", "device_class": None, "state_class": "measurement", "unit": None, "round": None},
+    "daily_consumption_oz": {"name": "Daily Consumption", "key": "daily_consumption_oz", "icon": "mdi:beer", "device_class": None, "state_class": "measurement", "unit": None, "round": None},
 
     "kegged_date": {"name": "Kegged Date", "key": ATTR_KEGGED_DATE, "icon": "mdi:calendar-start", "device_class": None, "state_class": None, "unit": None, "round": None},
     "expiration_date": {"name": "Expiration Date", "key": ATTR_EXPIRATION_DATE, "icon": "mdi:calendar-end", "device_class": None, "state_class": None, "unit": None, "round": None},
@@ -62,8 +65,7 @@ SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
 
     "leak_detection": {"name": "Leak Detection", "key": "leak_detection", "icon": "mdi:water-alert", "device_class": None, "state_class": None, "unit": None, "round": None},
 
-    # ✅ REMOVED: is_pouring sensor (now handled as a binary sensor “dot”)
-    # "is_pouring": {...}
+    # ✅ REMOVED: is_pouring sensor (binary sensor handles "dot")
 
     "last_pour": {"name": "Last Pour (Raw)", "key": "last_pour", "icon": "mdi:cup-water", "device_class": None, "state_class": "measurement", "unit": None, "round": 3},
     "last_pour_string": {"name": "Last Pour", "key": "last_pour_string", "icon": "mdi:cup-water", "device_class": None, "state_class": None, "unit": None, "round": None},
@@ -144,8 +146,54 @@ class KegSensor(SensorEntity):
             model="API v2",
         )
 
+    def _pour_display_unit(self) -> str:
+        """
+        Decide pour units:
+          - If user set select "Keg Volume Unit" (display_units.pour) to oz/ml -> use that
+          - Else infer from server:
+              * volume_unit indicates liters/ml -> ml
+              * volume_unit indicates gallons/oz -> oz
+              * beer_left_unit is liters -> ml
+              * last_pour_string contains ml/oz -> follow it
+          - Default oz
+        """
+        d = self._state_ref.get("data", {}).get(self.keg_id, {})
+        du = self._state_ref.get("display_units", {}) or {}
+
+        # 1) user override
+        pref = str(du.get("pour") or "").lower().strip()
+        if pref in ("oz", "ml"):
+            return pref
+
+        vol_u = str(d.get("volume_unit") or "").lower().strip()
+        beer_u = str(d.get("beer_left_unit") or "").lower().strip()
+        last_s = str(d.get("last_pour_string") or "").lower()
+
+        # explicit ml/oz in string
+        if "ml" in last_s:
+            return "ml"
+        if "oz" in last_s:
+            return "oz"
+
+        # explicit server unit
+        if vol_u in ("ml", "oz"):
+            return vol_u
+
+        # metric-ish
+        if vol_u in ("l", "liter", "litre", "liters", "litres"):
+            return "ml"
+        if beer_u in ("l", "liter", "litre", "liters", "litres", "litre"):
+            return "ml"
+
+        # us-ish
+        if vol_u in ("gal", "gallon", "gallons"):
+            return "oz"
+
+        return "oz"
+
     @property
     def native_unit_of_measurement(self) -> str | None:
+        # amount_left is dynamic (kg or L)
         if self.sensor_type == "amount_left":
             d = self._state_ref.get("data", {}).get(self.keg_id, {})
             u = str(d.get("beer_left_unit") or "").lower()
@@ -154,6 +202,11 @@ class KegSensor(SensorEntity):
             if u in ("litre", "liter", "liters", "litres", "l"):
                 return "L"
             return None
+
+        # pour stats dynamic (oz/ml)
+        if self.sensor_type in ("last_pour_oz", "daily_consumption_oz"):
+            return self._pour_display_unit()
+
         return self._static_unit
 
     @property
@@ -162,6 +215,21 @@ class KegSensor(SensorEntity):
         raw = data.get(self.keg_id, {}).get(self._meta["key"])
         if raw is None:
             return None
+
+        # pour stats are stored in oz in state; convert to ml if needed
+        if self.sensor_type in ("last_pour_oz", "daily_consumption_oz"):
+            if not isinstance(raw, (int, float)):
+                try:
+                    raw = float(raw)
+                except Exception:
+                    return None
+
+            unit = self._pour_display_unit()
+            if unit == "ml":
+                # cleaner UI: ml as integer
+                return int(round(float(raw) * OZ_TO_ML, 0))
+            # oz: 1 decimal
+            return round(float(raw), 1)
 
         r = self._meta.get("round")
         if isinstance(raw, (int, float)) and isinstance(r, int):

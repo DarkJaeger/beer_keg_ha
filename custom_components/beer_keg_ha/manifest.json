@@ -7,7 +7,7 @@
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/DarkJaeger/beer-keg-ha/issues",
   "loggers": ["custom_components.beer_keg_ha"],
-  "version": "2.4.9"
+  "version": "2.5.0"
 }
 
 
