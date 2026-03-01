@@ -245,8 +245,8 @@ class KegSensor(SensorEntity):
         if raw is None:
             return None
 
-        # Pretty-format the server-side keg date: "10 December 2025 (43 days ago)"
-        if self.sensor_type == "my_keg_date":
+        # Pretty-format date sensors: "10 December 2025 (43 days ago)"
+        if self.sensor_type in ("my_keg_date", "kegged_date", "expiration_date"):
             try:
                 keg_date = datetime.strptime(raw, "%m/%d/%Y").date()
                 today = date.today()
