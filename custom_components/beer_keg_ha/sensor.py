@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Set
 
 from homeassistant.components.sensor import SensorEntity
@@ -24,6 +24,7 @@ _LOGGER = logging.getLogger(__name__)
 KG_TO_LB = 2.20462262185
 L_TO_GAL = 0.26417205236  # US liquid gallon
 OZ_TO_ML = 29.5735295625  # US fl oz -> mL
+OZ_TO_L = OZ_TO_ML / 1000  # US fl oz -> liters
 
 
 def _should_use_us(d: Dict[str, Any]) -> bool:
@@ -115,6 +116,7 @@ SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
 
     "last_pour": {"name": "Last Pour (Raw)", "key": "last_pour", "icon": "mdi:cup-water", "device_class": None, "state_class": "measurement", "unit": None, "round": 3},
     "last_pour_string": {"name": "Last Pour", "key": "last_pour_string", "icon": "mdi:cup-water", "device_class": None, "state_class": None, "unit": None, "round": None},
+    "last_pour_time": {"name": "Last Pour Time", "key": "last_pour_string", "icon": "mdi:clock-outline", "device_class": None, "state_class": None, "unit": None, "round": None},
 
     "max_keg_volume": {"name": "Max Keg Volume", "key": "max_keg_volume", "icon": "mdi:keg", "device_class": "volume", "state_class": None, "unit": "L", "round": 3},
 
@@ -181,6 +183,10 @@ class KegSensor(SensorEntity):
         self._attr_device_class = self._meta.get("device_class")
         self._attr_state_class = self._meta.get("state_class")
         self._static_unit = self._meta.get("unit")
+        # State for last_pour_time tracking
+        self._last_pour_string: str | None = None
+        self._last_pour_initialized: bool = False
+        self._last_pour_timestamp: str | None = None
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -216,9 +222,13 @@ class KegSensor(SensorEntity):
         if self.sensor_type == "liters_remaining":
             return "gal" if _should_use_us(d) else "L"
 
-        # Dynamic: pour stats -> ml in metric, oz in US
-        if self.sensor_type in ("last_pour_oz", "daily_consumption_oz"):
+        # Dynamic: last pour -> ml in metric, oz in US
+        if self.sensor_type == "last_pour_oz":
             return "ml" if _should_use_ml(d) else "oz"
+
+        # Dynamic: daily consumption -> L in metric, oz in US
+        if self.sensor_type == "daily_consumption_oz":
+            return "L" if _should_use_ml(d) else "oz"
 
         return self._static_unit
 
@@ -226,18 +236,47 @@ class KegSensor(SensorEntity):
     def native_value(self) -> Any:
         data: Dict[str, Dict[str, Any]] = self._state_ref.get("data", {})
         d = data.get(self.keg_id, {})
+
+        # last_pour_time: return stored timestamp, not raw data
+        if self.sensor_type == "last_pour_time":
+            return self._last_pour_timestamp
+
         raw = d.get(self._meta["key"])
         if raw is None:
             return None
 
-        # Pour stats are stored as oz in coordinator; convert to ml if needed
-        if self.sensor_type in ("last_pour_oz", "daily_consumption_oz"):
+        # Pretty-format the server-side keg date: "10 December 2025 (43 days ago)"
+        if self.sensor_type == "my_keg_date":
+            try:
+                keg_date = datetime.strptime(raw, "%m/%d/%Y").date()
+                today = date.today()
+                days = (today - keg_date).days
+                pretty = f"{keg_date.day} {keg_date.strftime('%B %Y')}"
+                if days >= 0:
+                    return f"{pretty} ({days} days ago)"
+                else:
+                    return f"{pretty} (in {-days} days)"
+            except Exception:
+                return raw
+
+        # Last pour: stored as oz; convert to ml for metric, oz for US
+        if self.sensor_type == "last_pour_oz":
             try:
                 oz = float(raw)
             except Exception:
                 return None
             if _should_use_ml(d):
                 return int(round(oz * OZ_TO_ML, 0))
+            return round(oz, 1)
+
+        # Daily consumption: stored as oz; convert to L for metric, oz for US
+        if self.sensor_type == "daily_consumption_oz":
+            try:
+                oz = float(raw)
+            except Exception:
+                return None
+            if _should_use_ml(d):
+                return round(oz * OZ_TO_L, 2)
             return round(oz, 1)
 
         # Weight values are stored as kg; convert to lb if needed
@@ -272,8 +311,20 @@ class KegSensor(SensorEntity):
 
     @callback
     def _refresh_if_mine(self, event) -> None:
-        if (event.data or {}).get("keg_id") == self.keg_id:
-            self.async_write_ha_state()
+        if (event.data or {}).get("keg_id") != self.keg_id:
+            return
+        if self.sensor_type == "last_pour_time":
+            d = self._state_ref.get("data", {}).get(self.keg_id, {})
+            current = d.get("last_pour_string")
+            if not self._last_pour_initialized:
+                # First update after (re)start: capture current value without setting timestamp
+                self._last_pour_string = current
+                self._last_pour_initialized = True
+            elif current and current != self._last_pour_string:
+                self._last_pour_string = current
+                now = datetime.now()
+                self._last_pour_timestamp = f"{now.strftime('%a %b')} {now.day} at {now.strftime('%H:%M')}"
+        self.async_write_ha_state()
 
 
 class BeerKegDebugSensor(SensorEntity):
