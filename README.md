@@ -1,3 +1,4 @@
+<a href="https://www.buymeacoffee.com/LocutusOFB"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="41" width="174"></a>
 🍺 Beer Keg Scale (Home Assistant)
 
 Live keg monitoring for Home Assistant using WebSocket + REST fallback.
