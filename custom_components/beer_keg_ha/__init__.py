@@ -900,9 +900,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async def delete_keg_service(call: ServiceCall) -> None:
         """Delete a keg from the server DETS and remove all its HA entities."""
         keg_id = str(call.data["id"]).strip()
-        url = f"{base}/api/kegs/{keg_id}"
+        url = f"{base}/api/kegs/{keg_id}/delete"
         try:
-            async with session.delete(url) as resp:
+            async with session.post(url) as resp:
                 if resp.status not in range(200, 300):
                     _LOGGER.warning("%s: delete_keg server returned %s", DOMAIN, resp.status)
         except Exception as e:
