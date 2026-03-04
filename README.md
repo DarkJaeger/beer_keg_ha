@@ -1,218 +1,209 @@
 <a href="https://www.buymeacoffee.com/LocutusOFB"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="41" width="174"></a>
 
-🍺 Beer Keg Scale (Home Assistant)
-
-Live keg monitoring for Home Assistant using WebSocket + REST fallback.
-
-Tracks weight, volume, temperature, pours, daily consumption, beer metadata, and expiration with real-time updates from the Open Plaato Keg server (API v2).
-
-✨ Key Features
-
-⚡ Real-time WebSocket updates (REST polling fallback)
-
-⚖️ Live keg weight & remaining volume
-
-📊 Daily consumption & last pour (oz)
-
-🟢 Live “Pouring Now” indicator (based on weight change)
-
-🌡️ Keg & chip temperature
-
-🍺 Beer metadata from server
-
-Beer style
-
-Keg date
-
-OG / FG
-
-ABV
-
-📅 Automatic expiration date
-
-Calculated as keg date + 6 months
-
-🧮 Density-aware calculations (SG × volume)
-
-🧠 Robust against restarts & temporary disconnects
-
-📦 Installation (HACS – Custom Repository)
-
-Open HACS → Integrations
-
-Click ⋯ → Custom repositories
-
-Add:
-
-https://github.com/DarkJaeger/beer_keg_ha
-
-
-Type: Integration
-
-Search for Beer Keg Scale
-
-Install → Restart Home Assistant
-
-Go to Settings → Devices & Services → Add Integration
-
-Select Beer Keg Scale
-
-⚙️ Configuration
-Required
-
-WebSocket URL
-
-ws://<host>:8085/ws
-
-Optional / Advanced
-
-Empty keg weight (kg)
-
-Max keg volume (L)
-
-Unit system (metric / us)
-
-Measure unit (weight / volume)
-
-ℹ️ Most configuration is now handled by the server and reflected automatically in HA.
-
-🧠 How Pour Detection Works
-
-Instead of relying on unreliable is_pouring flags, Home Assistant detects pouring by:
-
-Monitoring live weight changes
-
-If total weight drops by ~0.02 kg (≈ 0.7 oz):
-
-Pouring indicator turns ON
-
-Indicator stays ON for a few seconds after the last detected drop
-
-This matches actual beer flow, not just scale state.
-
-📊 Entities
-Computed / Derived
-
-sensor.keg_<id>_total_weight_kg
-
-sensor.keg_<id>_beer_remaining_kg
-
-sensor.keg_<id>_liters_remaining
-
-sensor.keg_<id>_percent_of_beer_left
-
-sensor.keg_<id>_last_pour_oz
-
-sensor.keg_<id>_daily_consumption_oz
-
-binary_sensor.keg_<id>_pouring 🟢
-
-Beer Metadata (from server)
-
-sensor.keg_<id>_my_beer_style
-
-sensor.keg_<id>_my_keg_date
-
-sensor.keg_<id>_my_og
-
-sensor.keg_<id>_my_fg
-
-sensor.keg_<id>_my_abv
-
-Dates
-
-sensor.keg_<id>_kegged_date (manual override)
-
-sensor.keg_<id>_expiration_date (auto-calculated)
-
-sensor.keg_<id>_days_until_expiration
-
-Raw / Diagnostic
-
-Temperatures
-
-Wi-Fi strength
-
-Firmware / internal fields
-
-Leak detection
-
-Heartbeat
-
-🔧 Services
-Manual Keg Date (Expiration auto +6 months)
+# Beer Keg Scale (Home Assistant)
+
+Live keg and fermentation monitoring for Home Assistant using WebSocket + REST fallback.
+
+Tracks weight, volume, temperature, pours, daily consumption, beer metadata, and expiration with real-time updates from the [Open Plaato Keg](https://github.com/DarkJaeger/open-plaato-keg) server (API v2). Also supports **Plaato Airlock** fermentation devices with Grainfather and Brewfather integration.
+
+---
+
+## ✨ Key Features
+
+- ⚡ **Real-time WebSocket updates** (REST polling fallback every 10s)
+- ⚖️ **Live keg weight & remaining volume**
+- 📊 **Daily consumption & last pour tracking**
+- 🟢 **Live "Pouring Now" indicator** (based on live weight change)
+- 🌡️ **Keg & chip temperature**
+- 🍺 **Beer metadata** — style, keg date, OG / FG / ABV
+- 📅 **Automatic expiration date** — keg date + 6 months
+- 🧮 **Density-aware calculations** (SG × volume)
+- 🫧 **Plaato Airlock support** — temperature, BPM, bubble count, Grainfather & Brewfather forwarding
+- 🔧 **Keg command services** — tare, calibrate, set unit system, sensitivity and more
+- 🧹 **Auto entity cleanup** — stale entities from old versions removed on startup
+- 🧠 **Robust against restarts & temporary disconnects**
+
+---
+
+## 📦 Installation (HACS – Custom Repository)
+
+1. Open **HACS → Integrations**
+2. Click **⋯ → Custom repositories**
+3. Add: `https://github.com/DarkJaeger/beer_keg_ha` — Type: **Integration**
+4. Search for **Beer Keg Scale** → Install → Restart Home Assistant
+5. Go to **Settings → Devices & Services → Add Integration**
+6. Select **Beer Keg Scale** and enter your WebSocket URL
+
+---
+
+## ⚙️ Configuration
+
+| Field | Example | Notes |
+|---|---|---|
+| WebSocket URL | `ws://192.168.1.x:8085/ws` | Required |
+
+Most configuration is handled by the server and reflected automatically in HA.
+
+---
+
+## 📊 Entities
+
+### Per Keg Scale
+
+| Entity | Description |
+|---|---|
+| `sensor.keg_<id>_amount_left` | Beer remaining (server unit) |
+| `sensor.keg_<id>_total_weight_kg` | Total scale weight |
+| `sensor.keg_<id>_beer_remaining_kg` | Beer weight only |
+| `sensor.keg_<id>_liters_remaining` | Liters / gallons remaining |
+| `sensor.keg_<id>_percent_of_beer_left` | Fill percentage |
+| `sensor.keg_<id>_last_pour_oz` | Last pour size |
+| `sensor.keg_<id>_last_pour_time` | Timestamp of last pour |
+| `sensor.keg_<id>_daily_consumption_oz` | Today's consumption |
+| `binary_sensor.keg_<id>_pouring` | Live pouring indicator |
+| `sensor.keg_<id>_keg_temperature` | Keg temperature |
+| `sensor.keg_<id>_my_beer_style` | Beer style (from server) |
+| `sensor.keg_<id>_my_keg_date` | Keg date (from server) |
+| `sensor.keg_<id>_my_og` / `_my_fg` / `_my_abv` | Gravity & ABV |
+| `sensor.keg_<id>_kegged_date` | Manual kegged date |
+| `sensor.keg_<id>_expiration_date` | Auto-calculated expiry (+6 months) |
+| `sensor.keg_<id>_days_until_expiration` | Days remaining |
+
+Diagnostic sensors (temperatures, Wi-Fi, firmware, heartbeat, leak) are also created.
+
+### Per Plaato Airlock
+
+| Entity | Description |
+|---|---|
+| `sensor.airlock_<id>_temperature` | Fermentation temperature |
+| `sensor.airlock_<id>_bubbles_per_min` | BPM (bubbles per minute) |
+| `sensor.airlock_<id>_total_bubble_count` | Lifetime bubble count |
+| `sensor.airlock_<id>_error` | Error code from device |
+| `switch.airlock_<id>_grainfather_enabled` | Enable Grainfather forwarding |
+| `switch.airlock_<id>_brewfather_enabled` | Enable Brewfather forwarding |
+| `select.airlock_<id>_grainfather_temp_unit` | Grainfather temp unit |
+| `select.airlock_<id>_brewfather_temp_unit` | Brewfather temp unit |
+| `number.airlock_<id>_grainfather_sg` | Grainfather specific gravity |
+| `number.airlock_<id>_brewfather_sg` | Brewfather specific gravity |
+| `text.airlock_<id>_grainfather_url` | Grainfather stream URL |
+| `text.airlock_<id>_brewfather_url` | Brewfather custom stream URL |
+| `text.airlock_<id>_brewfather_og` | Brewfather OG |
+| `text.airlock_<id>_brewfather_batch_volume` | Brewfather batch volume (L) |
+
+---
+
+## 🔧 Services
+
+### Keg Date
+
+```yaml
 service: beer_keg_ha.set_keg_dates
 data:
   id: "<keg_id>"
   kegged_date: "MM/DD/YYYY"
+```
 
-Server Command Passthrough
+### Keg Commands
 
-beer_keg_ha.keg_tare
+All accept an optional `id` field — if omitted, uses the currently selected keg device.
 
-beer_keg_ha.keg_set_empty_keg_weight
+| Service | Description |
+|---|---|
+| `beer_keg_ha.keg_tare` | Tare the scale |
+| `beer_keg_ha.keg_set_empty_keg_weight` | Set empty keg weight (kg) |
+| `beer_keg_ha.keg_set_max_keg_volume` | Set max keg volume (L) |
+| `beer_keg_ha.keg_set_temperature_offset` | Set temperature calibration offset (°C) |
+| `beer_keg_ha.keg_calibrate_known_weight` | Calibrate with a known weight |
+| `beer_keg_ha.keg_set_beer_style` | Set beer style label |
+| `beer_keg_ha.keg_set_date` | Set keg date |
+| `beer_keg_ha.keg_set_unit_system` | Switch between `metric` / `us` |
+| `beer_keg_ha.keg_set_measure_unit` | Switch between `weight` / `volume` display |
+| `beer_keg_ha.keg_set_mode` | Switch between `beer` / `co2` mode |
+| `beer_keg_ha.keg_set_sensitivity` | Set pour sensitivity (0–10) |
 
-beer_keg_ha.keg_set_max_keg_volume
+### Airlock Services
 
-beer_keg_ha.keg_set_temperature_offset
+| Service | Description |
+|---|---|
+| `beer_keg_ha.set_airlock_label` | Set a human-readable label for an airlock |
+| `beer_keg_ha.configure_grainfather` | Enable/configure Grainfather forwarding |
+| `beer_keg_ha.configure_brewfather` | Enable/configure Brewfather forwarding |
 
-beer_keg_ha.keg_set_beer_style
+### Maintenance
 
-beer_keg_ha.keg_set_date
+| Service | Description |
+|---|---|
+| `beer_keg_ha.cleanup_entities` | Remove stale entities from previous versions |
+| `beer_keg_ha.refresh_kegs` | Force a REST poll for keg data |
+| `beer_keg_ha.republish_all` | Re-fire update events for all known kegs |
+| `beer_keg_ha.refresh_devices` | Refresh the keg device selector list |
+| `beer_keg_ha.export_history` | Export pour history to `/config/www/beer_keg_history.json` |
+| `beer_keg_ha.set_display_units` | Update dashboard display units |
 
-beer_keg_ha.keg_set_og
+---
 
-beer_keg_ha.keg_set_fg
+## 🧠 How Pour Detection Works
 
-beer_keg_ha.keg_calc_abv
+Instead of relying on unreliable `is_pouring` flags, pour detection monitors live weight changes:
 
-beer_keg_ha.keg_set_unit_system
+- If total weight drops by ~0.02 kg (≈ 0.7 oz) → pouring indicator turns ON
+- Indicator stays ON for a few seconds after the last detected drop
+- This matches actual beer flow, not just scale state
 
-beer_keg_ha.keg_set_measure_unit
+---
 
-beer_keg_ha.keg_set_mode
+## 🧹 Stale Entity Cleanup
 
-beer_keg_ha.keg_set_sensitivity
+When upgrading, old entities from previous versions are automatically removed 15 seconds after startup. You can also trigger this manually:
 
-📺 Lovelace Examples
+```yaml
+service: beer_keg_ha.cleanup_entities
+```
 
-Example cards (entities, gauges, history graphs, pouring indicator dots) are available in:
+A persistent notification will confirm how many entities were removed.
 
-/cards
+---
 
+## 📺 Lovelace Examples
 
-The pouring indicator works best with a Glance card and state_color: true.
+Example cards (entities, gauges, history graphs, pouring indicator dots) are available in `/cards`.
 
-🛠️ Troubleshooting
-Clear HACS Cache
+The pouring indicator works best with a **Glance card** and `state_color: true`.
 
-HACS → ⋯ → Clear downloads
+---
 
-HACS → ⋯ → Reload data
+## 🛠️ Troubleshooting
 
-Restart Home Assistant
+**HACS not updating?**
+- HACS → ⋯ → Clear downloads → Reload data → Restart HA
 
-Reinstall integration if needed
+**Entities missing after upgrade?**
+- Run `beer_keg_ha.cleanup_entities` to remove stale entities, then reload the integration
 
-Docker Users
+**WebSocket disconnects?**
+- Check the server is running: `http://<host>:8085/api/alive`
+- REST polling (every 10s) will keep data fresh while WS reconnects
 
-File Editor addon is not required
+**Airlock shows as keg briefly?**
+- Requires Open Plaato Keg server v0.1.42 or later which fixes phantom keg entries
 
-All configuration is handled via UI & integration services
+---
 
-📘 Full System Install Guide
+## 📘 Full System Install Guide
 
-👉
-https://github.com/DarkJaeger/beer_keg_ha/blob/main/Full%20system%20install.instructions.md
+[Full system install instructions](https://github.com/DarkJaeger/beer_keg_ha/blob/main/install%20guides/Full%20system%20install.instructions.md)
 
-ℹ️ Notes
+---
 
-WebSocket is primary; REST polling ensures resilience
+## ℹ️ Notes
 
-Works with Open Plaato Keg API v2
+- WebSocket is primary; REST polling ensures resilience
+- Works with Open Plaato Keg API v2
+- Designed for always-on wall displays & bar dashboards
+- Airlock data is polled every 30s and updated live via WebSocket
 
-Designed for always-on wall displays & bar dashboards
+---
 
-📄 License
+## 📄 License
 
 MIT License
