@@ -826,22 +826,62 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, on_stop)
 
     async def _cleanup_stale_entities() -> int:
-        """Remove entity registry entries for this config entry with no active state.
+        """Remove entity registry entries that no longer belong to an active keg or airlock.
 
-        An entity is considered stale if it is registered (not disabled) but has
-        no corresponding state in hass.states — meaning no platform loaded it.
+        Two cases are handled:
+        1. Registered but never loaded (unique_id from old code, no HA state).
+        2. Loaded but for a keg_id / airlock_id no longer returned by the server.
+
         Returns the count of removed entries.
         """
         registry = er.async_get(hass)
         entries = er.async_entries_for_config_entry(registry, entry.entry_id)
+
+        active_keg_ids = set(state.get("data", {}).keys())
+        active_airlock_ids = set(state.get("airlock_data", {}).keys())
+        prefix = f"{DOMAIN}_{entry.entry_id}_"
+
         removed = 0
         for reg_entry in entries:
             if reg_entry.disabled_by is not None:
                 continue  # user intentionally disabled — leave it
+
+            uid = reg_entry.unique_id or ""
+
+            # Case 1: no HA state at all (truly orphaned from old code)
             if hass.states.get(reg_entry.entity_id) is None:
-                _LOGGER.info("%s: removing stale entity %s", DOMAIN, reg_entry.entity_id)
+                _LOGGER.info("%s: removing orphaned entity %s", DOMAIN, reg_entry.entity_id)
                 registry.async_remove(reg_entry.entity_id)
                 removed += 1
+                continue
+
+            # Case 2: entity is loaded but for a keg/airlock no longer on the server
+            if not uid.startswith(prefix):
+                continue
+            remainder = uid[len(prefix):]
+
+            # Airlock entity: airlock_{airlock_id}_{type}
+            if remainder.startswith("airlock_"):
+                airlock_part = remainder[len("airlock_"):]
+                belongs_to_active = any(
+                    airlock_part == aid or airlock_part.startswith(aid + "_")
+                    for aid in active_airlock_ids
+                )
+                if not belongs_to_active:
+                    _LOGGER.info("%s: removing stale airlock entity %s", DOMAIN, reg_entry.entity_id)
+                    registry.async_remove(reg_entry.entity_id)
+                    removed += 1
+                continue
+
+            # Keg entity: {keg_id}_{type} — keg IDs are 32 hex chars
+            if len(remainder) >= 33 and remainder[32] == "_":
+                keg_id = remainder[:32]
+                if all(c in "0123456789abcdef" for c in keg_id):
+                    if keg_id not in active_keg_ids:
+                        _LOGGER.info("%s: removing stale keg entity %s", DOMAIN, reg_entry.entity_id)
+                        registry.async_remove(reg_entry.entity_id)
+                        removed += 1
+
         if removed:
             _LOGGER.info("%s: cleanup removed %d stale entities", DOMAIN, removed)
         return removed
@@ -856,6 +896,40 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     _register_service_once(hass, "cleanup_entities", cleanup_entities_service)
+
+    async def delete_keg_service(call: ServiceCall) -> None:
+        """Delete a keg from the server DETS and remove all its HA entities."""
+        keg_id = str(call.data["id"]).strip()
+        url = f"{base}/api/kegs/{keg_id}"
+        try:
+            async with session.delete(url) as resp:
+                if resp.status not in range(200, 300):
+                    _LOGGER.warning("%s: delete_keg server returned %s", DOMAIN, resp.status)
+        except Exception as e:
+            _LOGGER.error("%s: delete_keg request failed: %s", DOMAIN, e)
+
+        # Remove from local state so cleanup considers it gone
+        state.get("data", {}).pop(keg_id, None)
+        state.get("raw", {}).pop(keg_id, None)
+
+        # Remove all HA entities for this keg_id
+        registry = er.async_get(hass)
+        entries = er.async_entries_for_config_entry(registry, entry.entry_id)
+        prefix = f"{DOMAIN}_{entry.entry_id}_{keg_id}_"
+        removed = 0
+        for reg_entry in entries:
+            if (reg_entry.unique_id or "").startswith(prefix):
+                registry.async_remove(reg_entry.entity_id)
+                removed += 1
+
+        pn_create(
+            hass,
+            f"Deleted keg {keg_id[:8]}… and removed {removed} entities.",
+            title="Beer Keg Delete",
+        )
+
+    _register_service_once(hass, "delete_keg", delete_keg_service,
+        schema=vol.Schema({vol.Required("id"): cv.string}))
 
     async def _start(_event=None) -> None:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

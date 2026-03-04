@@ -2,6 +2,16 @@ cleanup_entities:
   name: Cleanup Stale Entities
   description: Remove entity registry entries from previous versions that are no longer provided by the integration
 
+delete_keg:
+  name: Delete Keg
+  description: Permanently delete a keg and all its data from the server, and remove all its HA entities
+  fields:
+    id:
+      name: Keg ID
+      required: true
+      selector:
+        text:
+
 export_history:
   name: Export History
   description: Write pour history to /config/www/beer_keg_history.json (served at /local/beer_keg_history.json)
