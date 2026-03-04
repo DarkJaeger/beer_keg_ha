@@ -898,8 +898,50 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _register_service_once(hass, "cleanup_entities", cleanup_entities_service)
 
     async def delete_keg_service(call: ServiceCall) -> None:
-        """Delete a keg from the server DETS and remove all its HA entities."""
-        keg_id = str(call.data["id"]).strip()
+        """Delete a keg from the server DETS and remove all its HA entities.
+
+        Accepts a full 32-char hex keg ID or any unique prefix (e.g. the
+        first 4 chars shown in the UI like "CA67").
+        """
+        keg_id_input = str(call.data["id"]).strip().lower()
+
+        # Resolve prefix → full keg_id from active state["data"]
+        keg_id = keg_id_input
+        active_kegs = list(state.get("data", {}).keys())
+        matches = [k for k in active_kegs if k.lower().startswith(keg_id_input)]
+        if len(matches) == 1:
+            keg_id = matches[0]
+        elif len(matches) > 1:
+            pn_create(
+                hass,
+                f"Prefix '{keg_id_input}' matches multiple kegs: "
+                f"{[k[:8] for k in matches]}. Use a longer prefix.",
+                title="Beer Keg Delete",
+            )
+            return
+        else:
+            # Fallback: scan entity registry for a keg whose unique_id starts
+            # with the given prefix (handles kegs already removed from state)
+            registry = er.async_get(hass)
+            uid_prefix = f"{DOMAIN}_{entry.entry_id}_"
+            for reg_entry in er.async_entries_for_config_entry(registry, entry.entry_id):
+                uid = reg_entry.unique_id or ""
+                if not uid.startswith(uid_prefix):
+                    continue
+                remainder = uid[len(uid_prefix):]
+                # Skip airlock entities
+                if remainder.startswith("airlock_"):
+                    continue
+                # Keg entities have a 32-char hex segment followed by "_"
+                if len(remainder) >= 33 and remainder[32] == "_":
+                    candidate = remainder[:32]
+                    if (
+                        all(c in "0123456789abcdef" for c in candidate)
+                        and candidate.startswith(keg_id_input)
+                    ):
+                        keg_id = candidate
+                        break
+
         url = f"{base}/api/kegs/{keg_id}/delete"
         try:
             async with session.post(url) as resp:
@@ -915,10 +957,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Remove all HA entities for this keg_id
         registry = er.async_get(hass)
         entries = er.async_entries_for_config_entry(registry, entry.entry_id)
-        prefix = f"{DOMAIN}_{entry.entry_id}_{keg_id}_"
+        uid_prefix = f"{DOMAIN}_{entry.entry_id}_{keg_id}_"
         removed = 0
         for reg_entry in entries:
-            if (reg_entry.unique_id or "").startswith(prefix):
+            if (reg_entry.unique_id or "").startswith(uid_prefix):
                 registry.async_remove(reg_entry.entity_id)
                 removed += 1
 
