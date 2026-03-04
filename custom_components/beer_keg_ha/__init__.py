@@ -45,6 +45,7 @@ DEVICES_REFRESH_SEC = 60
 WS_RECONNECT_DELAY = 5
 
 KG_TO_OZ = 35.274
+LBS_TO_KG = 0.453592
 
 DEFAULT_BEER_SG = 1.010
 WATER_DENSITY_KG_PER_L = 0.998
@@ -221,13 +222,31 @@ def _normalize_v2(keg: dict) -> dict:
         elif beer_left_unit in ("litre", "liter", "liters", "litres", "l"):
             liters_remaining = amount_left
             beer_remaining_kg = liters_remaining * DEFAULT_BEER_SG * WATER_DENSITY_KG_PER_L
+        elif beer_left_unit in ("lbs", "lb", "pounds"):
+            beer_remaining_kg = amount_left * LBS_TO_KG
+        elif beer_left_unit in ("gal", "gallon", "gallons"):
+            liters_remaining = amount_left * 3.78541
+            beer_remaining_kg = liters_remaining * DEFAULT_BEER_SG * WATER_DENSITY_KG_PER_L
 
     if beer_remaining_kg is not None and liters_remaining is None:
         liters_remaining = beer_remaining_kg / (DEFAULT_BEER_SG * WATER_DENSITY_KG_PER_L)
 
+    # weight_raw (pin 53) is the direct scale reading — use it for pour tracking
+    # when empty_keg_weight + beer_remaining_kg can't be computed (e.g. unset empty weight).
+    weight_raw = _coerce_float(keg.get("weight_raw"))
+    weight_unit_str = str(keg.get("weight_unit") or "").strip().lower()
+    weight_raw_kg: float | None = None
+    if weight_raw is not None:
+        if weight_unit_str in ("lbs", "lb", "pounds"):
+            weight_raw_kg = weight_raw * LBS_TO_KG
+        else:
+            weight_raw_kg = weight_raw
+
     total_weight_kg: float | None = None
     if empty_keg_weight is not None and beer_remaining_kg is not None:
         total_weight_kg = empty_keg_weight + beer_remaining_kg
+    elif weight_raw_kg is not None:
+        total_weight_kg = weight_raw_kg
 
     my_beer_style = keg.get("my_beer_style")
     my_keg_date = _normalize_payload_date_to_mmddyyyy(keg.get("my_keg_date"))
