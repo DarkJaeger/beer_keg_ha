@@ -1,3 +1,7 @@
+cleanup_entities:
+  name: Cleanup Stale Entities
+  description: Remove entity registry entries from previous versions that are no longer provided by the integration
+
 export_history:
   name: Export History
   description: Write pour history to /config/www/beer_keg_history.json (served at /local/beer_keg_history.json)
@@ -51,7 +55,7 @@ keg_tare:
 
 keg_set_empty_keg_weight:
   name: Set Empty Keg Weight
-  description: POST /api/kegs/:id/empty-keg
+  description: POST /api/kegs/:id/empty-keg-weight
   fields:
     id:
       name: Keg ID
@@ -216,3 +220,102 @@ keg_set_sensitivity:
           min: 0
           max: 10
           step: 1
+
+# ------------------------------------------------------------
+# Airlock services
+
+set_airlock_label:
+  name: Set Airlock Label
+  description: POST /api/airlocks/:id/label — set a human-readable label for an airlock
+  fields:
+    airlock_id:
+      name: Airlock ID
+      required: true
+      selector:
+        text:
+    label:
+      name: Label
+      required: true
+      selector:
+        text:
+
+configure_grainfather:
+  name: Configure Grainfather
+  description: POST /api/airlocks/:id/grainfather — enable/disable and configure Grainfather forwarding
+  fields:
+    airlock_id:
+      name: Airlock ID
+      required: true
+      selector:
+        text:
+    enabled:
+      name: Enabled
+      required: true
+      selector:
+        boolean:
+    url:
+      name: Grainfather URL
+      required: false
+      selector:
+        text:
+    unit:
+      name: Temperature unit
+      required: false
+      selector:
+        select:
+          options: [celsius, fahrenheit]
+    specific_gravity:
+      name: Specific gravity
+      required: false
+      selector:
+        number:
+          min: 0.9
+          max: 1.2
+          step: 0.001
+
+configure_brewfather:
+  name: Configure Brewfather
+  description: POST /api/airlocks/:id/brewfather — enable/disable and configure Brewfather forwarding
+  fields:
+    airlock_id:
+      name: Airlock ID
+      required: true
+      selector:
+        text:
+    enabled:
+      name: Enabled
+      required: true
+      selector:
+        boolean:
+    url:
+      name: Brewfather custom stream URL
+      required: false
+      selector:
+        text:
+    unit:
+      name: Temperature unit
+      required: false
+      selector:
+        select:
+          options: [celsius, fahrenheit]
+    specific_gravity:
+      name: Current SG
+      required: false
+      selector:
+        number:
+          min: 0.9
+          max: 1.2
+          step: 0.001
+    og:
+      name: Original gravity (OG)
+      required: false
+      selector:
+        text:
+    batch_volume:
+      name: Batch volume (L)
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 200
+          step: 0.1

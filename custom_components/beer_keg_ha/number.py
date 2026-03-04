@@ -12,11 +12,11 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN
+import aiohttp
+
+from .const import DOMAIN, PLATFORM_EVENT, AIRLOCK_EVENT
 
 _LOGGER = logging.getLogger(__name__)
-
-PLATFORM_EVENT = f"{DOMAIN}_update"
 
 #
 # Per-keg number types
@@ -122,6 +122,32 @@ TAP_NUMBER_TYPES: Dict[str, Dict[str, Any]] = {
     # You can add more here later, e.g. "og", "fg", etc.
 }
 
+#
+# Airlock-level numbers (SG per integration)
+#
+AIRLOCK_NUMBER_TYPES: Dict[str, Dict[str, Any]] = {
+    "grainfather_sg": {
+        "name": "Grainfather SG",
+        "key": "grainfather_sg",
+        "endpoint": "grainfather",
+        "server_param": "specific_gravity",
+        "min": 0.9,
+        "max": 1.2,
+        "step": 0.001,
+        "mode": NumberMode.BOX,
+    },
+    "brewfather_sg": {
+        "name": "Brewfather SG",
+        "key": "brewfather_sg",
+        "endpoint": "brewfather",
+        "server_param": "specific_gravity",
+        "min": 0.9,
+        "max": 1.2,
+        "step": 0.001,
+        "mode": NumberMode.BOX,
+    },
+}
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -216,6 +242,34 @@ async def async_setup_entry(
         hass.bus.async_listen(PLATFORM_EVENT, _on_update)
     )
 
+    #
+    # 4) Airlock numbers (SG per integration)
+    #
+    created_airlocks: Set[str] = state.setdefault("created_airlocks_number", set())
+
+    def create_airlock_numbers_for(airlock_id: str) -> None:
+        if airlock_id in created_airlocks:
+            return
+        new_ents: List[NumberEntity] = [
+            AirlockNumberEntity(hass, entry, airlock_id, num_type)
+            for num_type in AIRLOCK_NUMBER_TYPES.keys()
+        ]
+        created_airlocks.add(airlock_id)
+        async_add_entities(new_ents, True)
+
+    for airlock_id in list(state.get("airlock_data", {}).keys()):
+        create_airlock_numbers_for(airlock_id)
+
+    @callback
+    def _on_airlock_update(event) -> None:
+        airlock_id = (event.data or {}).get("airlock_id")
+        if airlock_id:
+            create_airlock_numbers_for(airlock_id)
+
+    entry.async_on_unload(
+        hass.bus.async_listen(AIRLOCK_EVENT, _on_airlock_update)
+    )
+
 
 class BeerKegGlobalNumberEntity(NumberEntity):
     """Global number entities for smoothing settings."""
@@ -261,40 +315,22 @@ class BeerKegGlobalNumberEntity(NumberEntity):
             return self._default
 
     async def async_set_native_value(self, value: float) -> None:
-        """Update the value in integration state and persist it."""
+        """Update the smoothing value in integration state and persist it."""
         domain_state = self.hass.data[DOMAIN][self.entry.entry_id]
-        data: Dict[str, Dict[str, Any]] = domain_state.setdefault("data", {})
-        keg = data.setdefault(self.keg_id, {})
+        domain_state[self._state_key] = float(value)
 
-        val = float(value)
-        keg[self._key] = val
-
-        # Also mirror into keg_config so it survives restart
-        keg_cfg_all: Dict[str, Dict[str, Any]] = domain_state.setdefault("keg_config", {})
-        cfg: Dict[str, Any] = keg_cfg_all.setdefault(self.keg_id, {})
-        cfg[self._key] = val
-
-        # Persist everything via prefs_store (same style as text.py / set_display_units)
         prefs_store = domain_state.get("prefs_store")
         if prefs_store is not None:
             await prefs_store.async_save(
                 {
                     "display_units": domain_state.get("display_units", {}),
-                    "keg_config": keg_cfg_all,
+                    "keg_config": domain_state.get("keg_config", {}),
                     "tap_text": domain_state.get("tap_text", {}),
                     "tap_numbers": domain_state.get("tap_numbers", {}),
                     "noise_deadband_kg": domain_state.get("noise_deadband_kg"),
                     "smoothing_alpha": domain_state.get("smoothing_alpha"),
                 }
             )
-
-        # Let any listening sensors/cards update
-        self.hass.bus.async_fire(
-            PLATFORM_EVENT,
-            {"keg_id": self.keg_id},
-        )
-        self.async_write_ha_state()
-
 
         self.async_write_ha_state()
 
@@ -475,3 +511,96 @@ class BeerKegTapNumberEntity(NumberEntity):
 
         # No specific keg_id to nudge; UI (cards) read this entity directly
         self.async_write_ha_state()
+
+
+class AirlockNumberEntity(NumberEntity):
+    """Number entity for airlock-level SG (Grainfather or Brewfather)."""
+
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        airlock_id: str,
+        num_type: str,
+    ) -> None:
+        self.hass = hass
+        self.entry = entry
+        self.airlock_id = airlock_id
+        self.num_type = num_type
+        self._meta = AIRLOCK_NUMBER_TYPES[num_type]
+        self._state_ref: Dict[str, Any] = hass.data[DOMAIN][entry.entry_id]
+
+        self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}_airlock_{airlock_id}_{num_type}"
+        self._attr_name = f"Airlock {airlock_id} {self._meta['name']}"
+        self._attr_mode = self._meta["mode"]
+        self._attr_native_min_value = self._meta["min"]
+        self._attr_native_max_value = self._meta["max"]
+        self._attr_native_step = self._meta["step"]
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"{self.entry.entry_id}_airlock_{self.airlock_id}")},
+            name=f"Airlock {self.airlock_id}",
+            manufacturer="open-plaato-keg",
+            model="Plaato Airlock",
+        )
+
+    def _airlock(self) -> Dict[str, Any]:
+        return self._state_ref.get("airlock_data", {}).get(self.airlock_id, {})
+
+    @property
+    def native_value(self) -> float | None:
+        val = self._airlock().get(self._meta["key"])
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
+    async def async_set_native_value(self, value: float) -> None:
+        from homeassistant.helpers.aiohttp_client import async_get_clientsession
+        a = self._airlock()
+        endpoint = self._meta["endpoint"]
+        base = self._state_ref.get("rest_base", "")
+
+        if endpoint == "grainfather":
+            body = {
+                "enabled": a.get("grainfather_enabled", False),
+                "unit": a.get("grainfather_unit") or "celsius",
+                "specific_gravity": value,
+                "url": a.get("grainfather_url") or "",
+            }
+        else:
+            body: Dict[str, Any] = {
+                "enabled": a.get("brewfather_enabled", False),
+                "unit": a.get("brewfather_temp_unit") or "celsius",
+                "specific_gravity": value,
+                "url": a.get("brewfather_url") or "",
+            }
+            if a.get("brewfather_og") is not None:
+                body["og"] = a["brewfather_og"]
+            if a.get("brewfather_batch_volume") is not None:
+                body["batch_volume"] = a["brewfather_batch_volume"]
+
+        url = f"{base}/api/airlocks/{self.airlock_id}/{endpoint}"
+        try:
+            session = async_get_clientsession(self.hass)
+            async with session.post(url, json=body) as resp:
+                if resp.status not in range(200, 300):
+                    _LOGGER.warning("AirlockNumberEntity POST %s returned %s", url, resp.status)
+        except aiohttp.ClientError as err:
+            _LOGGER.error("AirlockNumberEntity POST %s failed: %s", url, err)
+
+        self.async_write_ha_state()
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self.hass.bus.async_listen(AIRLOCK_EVENT, self._on_event))
+
+    @callback
+    def _on_event(self, event) -> None:
+        if (event.data or {}).get("airlock_id") == self.airlock_id:
+            self.async_write_ha_state()

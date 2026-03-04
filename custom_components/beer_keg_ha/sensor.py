@@ -13,6 +13,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import (
     DOMAIN,
     PLATFORM_EVENT,
+    AIRLOCK_EVENT,
     ATTR_LAST_UPDATE,
     ATTR_KEGGED_DATE,
     ATTR_EXPIRATION_DATE,
@@ -139,6 +140,13 @@ SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
     "internal_hbeat": {"name": "Internal Heartbeat", "key": "internal_hbeat", "icon": "mdi:heart-pulse", "device_class": None, "state_class": "measurement", "unit": "s", "round": None},
 }
 
+AIRLOCK_SENSOR_TYPES: Dict[str, Dict[str, Any]] = {
+    "temperature": {"name": "Temperature", "key": "temperature", "icon": "mdi:thermometer", "device_class": "temperature", "state_class": "measurement", "unit": "°C", "round": 1},
+    "bubbles_per_min": {"name": "Bubbles Per Minute", "key": "bubbles_per_min", "icon": "mdi:chart-bubble", "device_class": None, "state_class": "measurement", "unit": "BPM", "round": 1},
+    "total_bubble_count": {"name": "Total Bubble Count", "key": "total_bubble_count", "icon": "mdi:counter", "device_class": None, "state_class": "total_increasing", "unit": None, "round": None},
+    "error": {"name": "Error", "key": "error", "icon": "mdi:alert-circle", "device_class": None, "state_class": None, "unit": None, "round": None},
+}
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
     state = hass.data[DOMAIN][entry.entry_id]
@@ -163,6 +171,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             create_for(keg_id)
 
     entry.async_on_unload(hass.bus.async_listen(PLATFORM_EVENT, _on_update))
+
+    # Airlock sensors
+    created_airlocks: Set[str] = state.setdefault("created_airlocks_sensor", set())
+
+    def create_airlock_sensors_for(airlock_id: str) -> None:
+        if airlock_id in created_airlocks:
+            return
+        ents: List[SensorEntity] = [
+            AirlockSensor(hass, entry, airlock_id, sensor_key)
+            for sensor_key in AIRLOCK_SENSOR_TYPES.keys()
+        ]
+        async_add_entities(ents, True)
+        created_airlocks.add(airlock_id)
+
+    for airlock_id in list(state.get("airlock_data", {}).keys()):
+        create_airlock_sensors_for(airlock_id)
+
+    @callback
+    def _on_airlock_update(event) -> None:
+        airlock_id = (event.data or {}).get("airlock_id")
+        if airlock_id:
+            create_airlock_sensors_for(airlock_id)
+
+    entry.async_on_unload(hass.bus.async_listen(AIRLOCK_EVENT, _on_airlock_update))
 
 
 class KegSensor(SensorEntity):
@@ -363,3 +395,52 @@ class BeerKegDebugSensor(SensorEntity):
             "devices": list(st.get("devices", [])),
             "kegs": list(st.get("data", {}).keys()),
         }
+
+
+class AirlockSensor(SensorEntity):
+    _attr_should_poll = False
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, airlock_id: str, sensor_type: str) -> None:
+        self.hass = hass
+        self.entry = entry
+        self.airlock_id = airlock_id
+        self.sensor_type = sensor_type
+        self._state_ref: Dict[str, Any] = hass.data[DOMAIN][entry.entry_id]
+        self._meta = AIRLOCK_SENSOR_TYPES[sensor_type]
+
+        label = str(airlock_id)
+        self._attr_name = f"Airlock {label} {self._meta['name']}"
+        self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}_airlock_{airlock_id}_{sensor_type}"
+        self._attr_icon = self._meta.get("icon")
+        self._attr_device_class = self._meta.get("device_class")
+        self._attr_state_class = self._meta.get("state_class")
+        self._attr_native_unit_of_measurement = self._meta.get("unit")
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"{self.entry.entry_id}_airlock_{self.airlock_id}")},
+            name=f"Airlock {self.airlock_id}",
+            manufacturer="open-plaato-keg",
+            model="Plaato Airlock",
+        )
+
+    @property
+    def native_value(self) -> Any:
+        d = self._state_ref.get("airlock_data", {}).get(self.airlock_id, {})
+        raw = d.get(self._meta["key"])
+        if raw is None:
+            return None
+        rnd = self._meta.get("round")
+        if rnd is not None and isinstance(raw, (int, float)):
+            return round(raw, rnd)
+        return raw
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self.hass.bus.async_listen(AIRLOCK_EVENT, self._refresh_if_mine))
+
+    @callback
+    def _refresh_if_mine(self, event) -> None:
+        if (event.data or {}).get("airlock_id") != self.airlock_id:
+            return
+        self.async_write_ha_state()

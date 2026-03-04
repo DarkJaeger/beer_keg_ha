@@ -15,6 +15,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
@@ -24,6 +25,9 @@ from .const import (
     CONF_WS_URL,
     PLATFORM_EVENT,
     DEVICES_UPDATE_EVENT,
+    AIRLOCK_EVENT,
+    AIRLOCK_DEVICES_UPDATE_EVENT,
+    AIRLOCK_REST_POLL_SECONDS,
     ATTR_LAST_UPDATE,
     ATTR_KEGGED_DATE,
     ATTR_EXPIRATION_DATE,
@@ -34,7 +38,7 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 # ✅ IMPORTANT: include binary_sensor so pouring dot loads
-PLATFORMS = ["sensor", "select", "binary_sensor"]
+PLATFORMS = ["sensor", "select", "binary_sensor", "switch", "text", "number"]
 
 REST_POLL_SECONDS = 10
 DEVICES_REFRESH_SEC = 60
@@ -278,6 +282,38 @@ def _normalize_v2(keg: dict) -> dict:
     }
 
 
+def _normalize_airlock(raw: dict) -> dict:
+    """Normalize a raw airlock dict from the server into a clean typed dict."""
+
+    def _bool_str(v) -> bool:
+        return str(v).strip().lower() in ("true", "1", "yes")
+
+    def _str_or_none(v) -> str | None:
+        s = str(v).strip() if v is not None else ""
+        return s if s else None
+
+    return {
+        "id": str(raw.get("id", "unknown")),
+        "label": _str_or_none(raw.get("label")),
+        "temperature": _coerce_float(raw.get("temperature")),
+        "bubbles_per_min": _coerce_float(raw.get("bubbles_per_min")),
+        "total_bubble_count": _coerce_int(raw.get("total_bubble_count")),
+        "error": str(raw.get("error") or "0").strip(),
+        "grainfather_enabled": _bool_str(raw.get("grainfather_enabled", False)),
+        "grainfather_url": _str_or_none(raw.get("grainfather_url")),
+        "grainfather_unit": str(raw.get("grainfather_unit") or "celsius").strip(),
+        "grainfather_sg": _coerce_float(raw.get("grainfather_specific_gravity")),
+        "grainfather_last_sent_at": _str_or_none(raw.get("grainfather_last_sent_at")),
+        "brewfather_enabled": _bool_str(raw.get("brewfather_enabled", False)),
+        "brewfather_url": _str_or_none(raw.get("brewfather_url")),
+        "brewfather_temp_unit": str(raw.get("brewfather_temp_unit") or "celsius").strip(),
+        "brewfather_sg": _coerce_float(raw.get("brewfather_sg")),
+        "brewfather_og": _coerce_float(raw.get("brewfather_og")),
+        "brewfather_batch_volume": _coerce_float(raw.get("brewfather_batch_volume")),
+        "brewfather_last_sent_at": _str_or_none(raw.get("brewfather_last_sent_at")),
+    }
+
+
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     return True
 
@@ -298,8 +334,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     ws_url = _normalize_ws_url(ws_url)
 
     hass.data.setdefault(DOMAIN, {})
+    base = _rest_base_from_ws(ws_url)
     state: Dict[str, Any] = {
         "ws_url": ws_url,
+        "rest_base": base,
         "data": {},
         "raw": {},
         "devices": [],
@@ -309,10 +347,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "meta_store": Store(hass, 1, f"{DOMAIN}_meta"),
         # track WS is_pouring changes (for easy troubleshooting)
         "_last_is_pouring": {},
+        # Airlock state
+        "airlock_data": {},
+        "airlock_raw": {},
     }
     hass.data[DOMAIN][entry.entry_id] = state
-
-    base = _rest_base_from_ws(ws_url)
     session = async_get_clientsession(hass)
 
     try:
@@ -437,12 +476,58 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 
+    async def fetch_airlocks_rest() -> List[dict]:
+        url = f"{base}/api/airlocks"
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                txt = await resp.text()
+                raise RuntimeError(f"GET {url} -> {resp.status}: {txt[:200]}")
+            data = await resp.json()
+            if not isinstance(data, list):
+                raise RuntimeError("Expected list from /api/airlocks")
+            return data
+
+    async def publish_airlocks(payload_list: List[dict], *, source: str) -> None:
+        prev_ids = set(state["airlock_data"].keys())
+
+        for raw in payload_list:
+            if not isinstance(raw, dict):
+                continue
+
+            airlock_id = str(raw.get("id", "unknown"))
+            if airlock_id == "unknown":
+                continue
+
+            if source == "ws":
+                # WS sends partial updates — merge with existing raw state
+                existing_raw = state["airlock_raw"].get(airlock_id, {})
+                merged_raw = {**existing_raw, **raw}
+            else:
+                merged_raw = raw
+
+            norm = _normalize_airlock(merged_raw)
+            state["airlock_raw"][airlock_id] = merged_raw
+            state["airlock_data"][airlock_id] = norm
+            state[ATTR_LAST_UPDATE] = datetime.now(timezone.utc)
+            hass.bus.async_fire(AIRLOCK_EVENT, {"airlock_id": airlock_id})
+
+        new_ids = set(state["airlock_data"].keys())
+        if new_ids != prev_ids:
+            hass.bus.async_fire(AIRLOCK_DEVICES_UPDATE_EVENT, {"ids": sorted(new_ids)})
+
     async def rest_poll(_now=None) -> None:
         try:
             kegs = await fetch_kegs_rest()
             await publish_kegs(kegs, source="rest")
         except Exception as e:
             _LOGGER.debug("%s: REST poll failed: %s", DOMAIN, e)
+
+    async def airlock_poll(_now=None) -> None:
+        try:
+            airlocks = await fetch_airlocks_rest()
+            await publish_airlocks(airlocks, source="rest")
+        except Exception as e:
+            _LOGGER.debug("%s: Airlock REST poll failed: %s", DOMAIN, e)
 
     async def devices_poll(_now=None) -> None:
         await fetch_devices()
@@ -460,6 +545,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         try:
                             data = json.loads(msg.data)
                         except Exception:
+                            continue
+
+                        # Airlock updates: {"type": "airlock", "data": {"id": ..., ...}}
+                        if isinstance(data, dict) and data.get("type") == "airlock":
+                            inner = data.get("data")
+                            if isinstance(inner, dict) and inner.get("id"):
+                                await publish_airlocks([inner], source="ws")
                             continue
 
                         # ✅ FIX: server can send a SINGLE keg object (page uses this)
@@ -510,6 +602,221 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     _register_service_once(hass, "set_keg_dates", set_keg_dates, schema=_SCHEMA_SET_DATES)
 
+    # ── Keg command services ─────────────────────────────────────────────────
+
+    def _resolve_keg_id(call: ServiceCall) -> str | None:
+        """Return the keg_id from the call or fall back to the selected device."""
+        keg_id = call.data.get("id") or state.get("selected_device")
+        return str(keg_id) if keg_id else None
+
+    async def _keg_post(keg_id: str, path: str, body: dict | None = None) -> bool:
+        """POST to a keg command endpoint. Returns True on success."""
+        url = f"{base}/api/kegs/{keg_id}/{path}"
+        try:
+            kwargs = {"json": body} if body else {}
+            async with session.post(url, **kwargs) as resp:
+                if resp.status in range(200, 300):
+                    return True
+                _LOGGER.warning("%s: %s returned %s", DOMAIN, url, resp.status)
+                return False
+        except Exception as e:
+            _LOGGER.error("%s: POST %s failed: %s", DOMAIN, url, e)
+            return False
+
+    async def keg_tare(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if keg_id:
+            await _keg_post(keg_id, "tare")
+
+    _register_service_once(hass, "keg_tare", keg_tare)
+
+    async def keg_set_empty_keg_weight(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if keg_id:
+            await _keg_post(keg_id, "empty-keg-weight", {"value": str(call.data["value"])})
+
+    _register_service_once(hass, "keg_set_empty_keg_weight", keg_set_empty_keg_weight,
+        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.Coerce(float)}))
+
+    async def keg_set_max_keg_volume(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if keg_id:
+            await _keg_post(keg_id, "max-keg-volume", {"value": str(call.data["value"])})
+
+    _register_service_once(hass, "keg_set_max_keg_volume", keg_set_max_keg_volume,
+        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.Coerce(float)}))
+
+    async def keg_set_temperature_offset(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if keg_id:
+            await _keg_post(keg_id, "temperature-offset", {"value": str(call.data["value"])})
+
+    _register_service_once(hass, "keg_set_temperature_offset", keg_set_temperature_offset,
+        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.Coerce(float)}))
+
+    async def keg_calibrate_known_weight(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if keg_id:
+            await _keg_post(keg_id, "calibrate-known-weight", {"value": str(call.data["value"])})
+
+    _register_service_once(hass, "keg_calibrate_known_weight", keg_calibrate_known_weight,
+        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.Coerce(float)}))
+
+    async def keg_set_beer_style(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if keg_id:
+            await _keg_post(keg_id, "beer-style", {"value": str(call.data["value"])})
+
+    _register_service_once(hass, "keg_set_beer_style", keg_set_beer_style,
+        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): cv.string}))
+
+    async def keg_set_date(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if keg_id:
+            await _keg_post(keg_id, "date", {"value": str(call.data["value"])})
+
+    _register_service_once(hass, "keg_set_date", keg_set_date,
+        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): cv.string}))
+
+    async def keg_set_unit_system(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if keg_id:
+            await _keg_post(keg_id, "unit", {"value": str(call.data["value"])})
+
+    _register_service_once(hass, "keg_set_unit_system", keg_set_unit_system,
+        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.In(["metric", "us"])}))
+
+    async def keg_set_measure_unit(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if keg_id:
+            await _keg_post(keg_id, "measure-unit", {"value": str(call.data["value"])})
+
+    _register_service_once(hass, "keg_set_measure_unit", keg_set_measure_unit,
+        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.In(["weight", "volume"])}))
+
+    async def keg_set_mode(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if keg_id:
+            await _keg_post(keg_id, "keg-mode", {"value": str(call.data["value"])})
+
+    _register_service_once(hass, "keg_set_mode", keg_set_mode,
+        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.In(["beer", "co2"])}))
+
+    async def keg_set_sensitivity(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if keg_id:
+            await _keg_post(keg_id, "sensitivity", {"value": str(call.data["value"])})
+
+    _register_service_once(hass, "keg_set_sensitivity", keg_set_sensitivity,
+        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.All(vol.Coerce(int), vol.Range(min=0, max=10))}))
+
+    # ── Airlock services ────────────────────────────────────────────────────
+
+    _SCHEMA_SET_AIRLOCK_LABEL = vol.Schema({
+        vol.Required("id"): cv.string,
+        vol.Required("value"): cv.string,
+    })
+
+    async def set_airlock_label(call: ServiceCall) -> None:
+        airlock_id = str(call.data["id"])
+        label = str(call.data["value"])
+        url = f"{base}/api/airlocks/{airlock_id}/label"
+        try:
+            async with session.post(url, json={"value": label}) as resp:
+                if resp.status == 200:
+                    state["airlock_data"].setdefault(airlock_id, {})["label"] = label
+                    hass.bus.async_fire(AIRLOCK_EVENT, {"airlock_id": airlock_id})
+                else:
+                    _LOGGER.warning("%s: set_airlock_label got %s", DOMAIN, resp.status)
+        except Exception as e:
+            _LOGGER.error("%s: set_airlock_label failed: %s", DOMAIN, e)
+
+    _register_service_once(hass, "set_airlock_label", set_airlock_label, schema=_SCHEMA_SET_AIRLOCK_LABEL)
+
+    _SCHEMA_CONFIGURE_GRAINFATHER = vol.Schema({
+        vol.Required("id"): cv.string,
+        vol.Optional("enabled"): cv.boolean,
+        vol.Optional("url"): cv.string,
+        vol.Optional("unit"): vol.In(["celsius", "fahrenheit"]),
+        vol.Optional("specific_gravity"): vol.Coerce(float),
+    })
+
+    async def configure_grainfather(call: ServiceCall) -> None:
+        airlock_id = str(call.data["id"])
+        current = state["airlock_data"].get(airlock_id, {})
+        payload = {
+            "enabled": call.data.get("enabled", current.get("grainfather_enabled", False)),
+            "url": call.data.get("url", current.get("grainfather_url") or ""),
+            "unit": call.data.get("unit", current.get("grainfather_unit") or "celsius"),
+            "specific_gravity": call.data.get("specific_gravity", current.get("grainfather_sg") or 1.0),
+        }
+        url = f"{base}/api/airlocks/{airlock_id}/grainfather"
+        try:
+            async with session.post(url, json=payload) as resp:
+                if resp.status == 200:
+                    current.update({
+                        "grainfather_enabled": payload["enabled"],
+                        "grainfather_url": payload["url"] or None,
+                        "grainfather_unit": payload["unit"],
+                        "grainfather_sg": payload["specific_gravity"],
+                    })
+                    state["airlock_data"][airlock_id] = current
+                    hass.bus.async_fire(AIRLOCK_EVENT, {"airlock_id": airlock_id})
+                else:
+                    _LOGGER.warning("%s: configure_grainfather got %s", DOMAIN, resp.status)
+        except Exception as e:
+            _LOGGER.error("%s: configure_grainfather failed: %s", DOMAIN, e)
+
+    _register_service_once(hass, "configure_grainfather", configure_grainfather, schema=_SCHEMA_CONFIGURE_GRAINFATHER)
+
+    _SCHEMA_CONFIGURE_BREWFATHER = vol.Schema({
+        vol.Required("id"): cv.string,
+        vol.Optional("enabled"): cv.boolean,
+        vol.Optional("url"): cv.string,
+        vol.Optional("unit"): vol.In(["celsius", "fahrenheit"]),
+        vol.Optional("specific_gravity"): vol.Coerce(float),
+        vol.Optional("og"): vol.Coerce(float),
+        vol.Optional("batch_volume"): vol.Coerce(float),
+    })
+
+    async def configure_brewfather(call: ServiceCall) -> None:
+        airlock_id = str(call.data["id"])
+        current = state["airlock_data"].get(airlock_id, {})
+        payload = {
+            "enabled": call.data.get("enabled", current.get("brewfather_enabled", False)),
+            "url": call.data.get("url", current.get("brewfather_url") or ""),
+            "unit": call.data.get("unit", current.get("brewfather_temp_unit") or "celsius"),
+            "specific_gravity": call.data.get("specific_gravity", current.get("brewfather_sg") or 1.0),
+        }
+        if "og" in call.data:
+            payload["og"] = call.data["og"]
+        elif current.get("brewfather_og") is not None:
+            payload["og"] = current["brewfather_og"]
+        if "batch_volume" in call.data:
+            payload["batch_volume"] = call.data["batch_volume"]
+        elif current.get("brewfather_batch_volume") is not None:
+            payload["batch_volume"] = current["brewfather_batch_volume"]
+        url = f"{base}/api/airlocks/{airlock_id}/brewfather"
+        try:
+            async with session.post(url, json=payload) as resp:
+                if resp.status == 200:
+                    current.update({
+                        "brewfather_enabled": payload["enabled"],
+                        "brewfather_url": payload["url"] or None,
+                        "brewfather_temp_unit": payload["unit"],
+                        "brewfather_sg": payload["specific_gravity"],
+                        "brewfather_og": payload.get("og"),
+                        "brewfather_batch_volume": payload.get("batch_volume"),
+                    })
+                    state["airlock_data"][airlock_id] = current
+                    hass.bus.async_fire(AIRLOCK_EVENT, {"airlock_id": airlock_id})
+                else:
+                    _LOGGER.warning("%s: configure_brewfather got %s", DOMAIN, resp.status)
+        except Exception as e:
+            _LOGGER.error("%s: configure_brewfather failed: %s", DOMAIN, e)
+
+    _register_service_once(hass, "configure_brewfather", configure_brewfather, schema=_SCHEMA_CONFIGURE_BREWFATHER)
+
     async def on_stop(_event) -> None:
         try:
             await state["meta_store"].async_save(state.get("meta", {}))
@@ -517,6 +824,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             pass
 
     hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, on_stop)
+
+    async def _cleanup_stale_entities() -> int:
+        """Remove entity registry entries for this config entry with no active state.
+
+        An entity is considered stale if it is registered (not disabled) but has
+        no corresponding state in hass.states — meaning no platform loaded it.
+        Returns the count of removed entries.
+        """
+        registry = er.async_get(hass)
+        entries = er.async_entries_for_config_entry(registry, entry.entry_id)
+        removed = 0
+        for reg_entry in entries:
+            if reg_entry.disabled_by is not None:
+                continue  # user intentionally disabled — leave it
+            if hass.states.get(reg_entry.entity_id) is None:
+                _LOGGER.info("%s: removing stale entity %s", DOMAIN, reg_entry.entity_id)
+                registry.async_remove(reg_entry.entity_id)
+                removed += 1
+        if removed:
+            _LOGGER.info("%s: cleanup removed %d stale entities", DOMAIN, removed)
+        return removed
+
+    async def cleanup_entities_service(_call: ServiceCall | None = None) -> None:
+        removed = await _cleanup_stale_entities()
+        pn_create(
+            hass,
+            f"Removed {removed} stale Beer Keg entities from the registry."
+            if removed else "No stale Beer Keg entities found.",
+            title="Beer Keg Cleanup",
+        )
+
+    _register_service_once(hass, "cleanup_entities", cleanup_entities_service)
 
     async def _start(_event=None) -> None:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -526,6 +865,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.async_create_task(connect_websocket())
         async_track_time_interval(hass, rest_poll, timedelta(seconds=REST_POLL_SECONDS))
         async_track_time_interval(hass, devices_poll, timedelta(seconds=DEVICES_REFRESH_SEC))
+        await airlock_poll()
+        async_track_time_interval(hass, airlock_poll, timedelta(seconds=AIRLOCK_REST_POLL_SECONDS))
+
+        # Wait for all entities to write their initial state, then remove stale ones
+        await asyncio.sleep(15)
+        await _cleanup_stale_entities()
 
         _LOGGER.info("%s: v2-only WS+REST started", DOMAIN)
 

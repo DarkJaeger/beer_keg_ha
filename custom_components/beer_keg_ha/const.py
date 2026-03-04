@@ -45,3 +45,8 @@ ATTR_DAYS_UNTIL_EXPIRATION = "days_until_expiration"
 
 # --- Date format for UI/services ---
 DATE_FORMAT = "%m/%d/%Y"
+
+# --- Airlock events and polling ---
+AIRLOCK_EVENT = f"{DOMAIN}_airlock_update"
+AIRLOCK_DEVICES_UPDATE_EVENT = f"{DOMAIN}_airlock_devices_update"
+AIRLOCK_REST_POLL_SECONDS = 30

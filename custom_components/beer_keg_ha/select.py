@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
@@ -9,7 +9,9 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, PLATFORM_EVENT, DEVICES_UPDATE_EVENT
+import aiohttp
+
+from .const import DOMAIN, PLATFORM_EVENT, DEVICES_UPDATE_EVENT, AIRLOCK_EVENT
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -26,6 +28,29 @@ async def async_setup_entry(
     state.setdefault("selected_device", None)
 
     async_add_entities([BeerKegDeviceSelect(hass, entry, state)], True)
+
+    # Airlock temp unit selects
+    created: Set[str] = state.setdefault("created_airlocks_select", set())
+
+    def create_airlock_selects_for(airlock_id: str) -> None:
+        if airlock_id in created:
+            return
+        async_add_entities([
+            AirlockTempUnitSelect(hass, entry, airlock_id, "grainfather"),
+            AirlockTempUnitSelect(hass, entry, airlock_id, "brewfather"),
+        ], True)
+        created.add(airlock_id)
+
+    for airlock_id in list(state.get("airlock_data", {}).keys()):
+        create_airlock_selects_for(airlock_id)
+
+    @callback
+    def _on_airlock_update(event) -> None:
+        airlock_id = (event.data or {}).get("airlock_id")
+        if airlock_id:
+            create_airlock_selects_for(airlock_id)
+
+    entry.async_on_unload(hass.bus.async_listen(AIRLOCK_EVENT, _on_airlock_update))
 
 
 class BeerKegDeviceSelect(SelectEntity):
@@ -119,3 +144,93 @@ class BeerKegDeviceSelect(SelectEntity):
         self.async_on_remove(
             self.hass.bus.async_listen(DEVICES_UPDATE_EVENT, _handle_devices_update)
         )
+
+
+class AirlockTempUnitSelect(SelectEntity):
+    """Select entity for Grainfather or Brewfather temperature unit per airlock."""
+
+    _attr_should_poll = False
+    _attr_options = ["celsius", "fahrenheit"]
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        airlock_id: str,
+        integration: str,  # "grainfather" or "brewfather"
+    ) -> None:
+        self.hass = hass
+        self.entry = entry
+        self.airlock_id = airlock_id
+        self.integration = integration
+        self._state_ref: Dict[str, Any] = hass.data[DOMAIN][entry.entry_id]
+
+        self._attr_name = f"Airlock {airlock_id} {integration.title()} Temp Unit"
+        self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}_airlock_{airlock_id}_{integration}_temp_unit"
+        self._attr_icon = "mdi:thermometer"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"{self.entry.entry_id}_airlock_{self.airlock_id}")},
+            name=f"Airlock {self.airlock_id}",
+            manufacturer="open-plaato-keg",
+            model="Plaato Airlock",
+        )
+
+    def _airlock(self) -> Dict[str, Any]:
+        return self._state_ref.get("airlock_data", {}).get(self.airlock_id, {})
+
+    @property
+    def current_option(self) -> str:
+        a = self._airlock()
+        if self.integration == "grainfather":
+            return a.get("grainfather_unit") or "celsius"
+        return a.get("brewfather_temp_unit") or "celsius"
+
+    async def async_select_option(self, option: str) -> None:
+        if option not in self._attr_options:
+            return
+        a = self._airlock()
+        base = self._state_ref.get("rest_base", "")
+
+        if self.integration == "grainfather":
+            body = {
+                "enabled": a.get("grainfather_enabled", False),
+                "unit": option,
+                "specific_gravity": a.get("grainfather_sg") or 1.0,
+                "url": a.get("grainfather_url") or "",
+            }
+            endpoint = "grainfather"
+        else:
+            body: Dict[str, Any] = {
+                "enabled": a.get("brewfather_enabled", False),
+                "unit": option,
+                "specific_gravity": a.get("brewfather_sg") or 1.0,
+                "url": a.get("brewfather_url") or "",
+            }
+            if a.get("brewfather_og") is not None:
+                body["og"] = a["brewfather_og"]
+            if a.get("brewfather_batch_volume") is not None:
+                body["batch_volume"] = a["brewfather_batch_volume"]
+            endpoint = "brewfather"
+
+        url = f"{base}/api/airlocks/{self.airlock_id}/{endpoint}"
+        try:
+            from homeassistant.helpers.aiohttp_client import async_get_clientsession
+            session = async_get_clientsession(self.hass)
+            async with session.post(url, json=body) as resp:
+                if resp.status not in range(200, 300):
+                    _LOGGER.warning("AirlockTempUnitSelect POST %s returned %s", url, resp.status)
+        except aiohttp.ClientError as err:
+            _LOGGER.error("AirlockTempUnitSelect POST %s failed: %s", url, err)
+
+        self.async_write_ha_state()
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self.hass.bus.async_listen(AIRLOCK_EVENT, self._on_event))
+
+    @callback
+    def _on_event(self, event) -> None:
+        if (event.data or {}).get("airlock_id") == self.airlock_id:
+            self.async_write_ha_state()
