@@ -1,0 +1,59 @@
+type: vertical-stack
+cards:
+  - type: entities
+    title: 🍺 Tap 1 Status
+    entities:
+      - entity: sensor.keg_d00d_amount_left_raw
+        name: Current Weight
+        icon: mdi:scale
+      - entity: sensor.keg_d00d_percent_of_beer_left
+        name: Fill Level
+        icon: mdi:beer
+      - entity: sensor.keg_d00d_temperature_string
+        name: Temperature
+        icon: mdi:thermometer
+      - entity: sensor.keg_d00d_last_pour
+        name: Last Pour
+        icon: mdi:cup
+      - entity: sensor.keg_d00d_daily_consumption
+        name: Daily Consumption
+        icon: mdi:calendar-today
+      - entity: sensor.keg_d00d_og_2
+      - entity: sensor.keg_d00d_fg_2
+      - entity: sensor.keg_d00d_internal_heartbeat
+        name: Unit Heartbeat
+        icon: fa6-solid:heart-pulse
+        secondary_info: none
+      - entity: sensor.keg_d00d_expiration_date
+        name: Expiration Date
+    state_color: true
+  - type: glance
+    title: Pouring Now
+    state_color: true
+    show_name: false
+    show_state: false
+    entities:
+      - entity: binary_sensor.keg_0x24_pouring
+        icon: mdi:circle
+    card_mod:
+      style: |
+        :host {
+          --state-binary_sensor-on-color: #00c853;
+        }
+  - type: gauge
+    entity: sensor.keg_d00d_percent_of_beer_left
+    name: Tap1 Fill %
+    min: 0
+    max: 100
+    severity:
+      green: 50
+      yellow: 25
+      red: 10
+  - type: history-graph
+    title: Tap1 – Last 24h
+    hours_to_show: 24
+    entities:
+      - entity: sensor.keg_d00d_amount_left_raw
+        name: Weight
+      - entity: sensor.keg_d00d_daily_consumption
+        name: Daily Consumption
