@@ -135,6 +135,7 @@ class KegPouringByWeightBinarySensor(BinarySensorEntity):
             self._schedule_turn_off()
 
     async def async_added_to_hass(self) -> None:
+        self.hass.data[DOMAIN][self.entry.entry_id].setdefault("registered_unique_ids", set()).add(self._attr_unique_id)
         # Initialize from current data immediately
         self._process_update()
 

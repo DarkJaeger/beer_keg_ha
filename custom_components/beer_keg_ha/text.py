@@ -40,41 +40,6 @@ TEXT_TYPES: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# -------------------------------------------------------------------
-# TAP LIST TEXT FIELDS (Tap 1–12: name/style/OG/FG/notes)
-# -------------------------------------------------------------------
-
-TAP_COUNT = 12
-
-TAP_TEXT_FIELDS: Dict[str, Dict[str, Any]] = {
-    "name": {
-        "label": "Tap Name",
-        "max": 64,
-        "icon": "mdi:beer",
-    },
-    "style": {
-        "label": "Style",
-        "max": 64,
-        "icon": "mdi:beer-outline",
-    },
-    "og": {
-        "label": "OG",
-        "max": 16,
-        "icon": "mdi:alpha-o-circle",
-    },
-    "fg": {
-        "label": "FG",
-        "max": 16,
-        "icon": "mdi:alpha-f-circle",
-    },
-    "notes": {
-        "label": "Notes",
-        # Full text stored here (we’ll keep state <= 255 chars)
-        "max": 4096,
-        "icon": "mdi:note-text",
-    },
-}
-
 
 # -------------------------------------------------------------------
 # SETUP
@@ -85,7 +50,7 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up per-keg text + tap-list text entities."""
+    """Set up per-keg text entities."""
     state = hass.data[DOMAIN][entry.entry_id]
     created: Set[str] = state.setdefault("created_text_kegs", set())
 
@@ -101,9 +66,6 @@ async def async_setup_entry(
 
     for keg_id in list(state.get("data", {}).keys()):
         create_for_keg(keg_id)
-
-    # ---------- Tap-list text entities ----------
-    await async_setup_tap_text(hass, entry, async_add_entities, entities)
 
     # Add everything we have so far
     async_add_entities(entities, True)
@@ -236,15 +198,13 @@ class BeerKegTextEntity(TextEntity):
         keg_data = data.setdefault(self.keg_id, {})
         keg_data[self._key] = value
 
-        # Persist (along with display_units + tap config + smoothing settings)
+        # Persist (along with display_units + smoothing settings)
         prefs_store = domain_state.get("prefs_store")
         if prefs_store is not None:
             await prefs_store.async_save(
                 {
                     "display_units": domain_state.get("display_units", {}),
                     "keg_config": keg_cfg,
-                    "tap_text": domain_state.get("tap_text", {}),
-                    "tap_numbers": domain_state.get("tap_numbers", {}),
                     "noise_deadband_kg": domain_state.get("noise_deadband_kg"),
                     "smoothing_alpha": domain_state.get("smoothing_alpha"),
                 }
@@ -259,6 +219,7 @@ class BeerKegTextEntity(TextEntity):
 
     async def async_added_to_hass(self) -> None:
         """Refresh when this keg is updated elsewhere."""
+        self.hass.data[DOMAIN][self.entry.entry_id].setdefault("registered_unique_ids", set()).add(self._attr_unique_id)
 
         @callback
         def _handle_update(event) -> None:
@@ -268,128 +229,6 @@ class BeerKegTextEntity(TextEntity):
         self.async_on_remove(
             self.hass.bus.async_listen(PLATFORM_EVENT, _handle_update)
         )
-
-
-# -------------------------------------------------------------------
-# TAP LIST TEXT ENTITIES
-# -------------------------------------------------------------------
-
-async def async_setup_tap_text(
-    hass: HomeAssistant,
-    entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
-    entities: List[TextEntity],
-) -> None:
-    """Create text entities for taps (1..TAP_COUNT)."""
-    state = hass.data[DOMAIN][entry.entry_id]
-    tapstore = state.setdefault("tap_text", {})
-
-    for tap in range(1, TAP_COUNT + 1):
-        tap_id = f"tap_{tap}"  # e.g. "tap_1", "tap_2" ...
-        tapstore.setdefault(tap_id, {})
-
-        for key, meta in TAP_TEXT_FIELDS.items():
-            entities.append(BeerTapTextEntity(hass, entry, tap_id, key, meta))
-
-
-class BeerTapTextEntity(TextEntity):
-    """Text entity for tap list fields: name/style/OG/FG/long notes."""
-
-    _attr_should_poll = False
-
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        entry: ConfigEntry,
-        tap_id: str,
-        field_key: str,
-        meta: Dict[str, Any],
-    ) -> None:
-        self.hass = hass
-        self.entry = entry
-        self.tap_id = tap_id            # "tap_1"
-        self.field_key = field_key      # "name", "style", "og", "fg", "notes"
-        self.meta = meta
-
-        # tap_text structure is maintained in __init__.py + here
-        self.state_ref: Dict[str, Dict[str, Any]] = hass.data[DOMAIN][entry.entry_id]["tap_text"]
-
-        self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}_{tap_id}_{field_key}"
-        self._attr_name = f"{tap_id.upper()} {meta['label']}"
-        self._attr_icon = meta.get("icon")
-        self._attr_mode = "text"
-        self._attr_min = 0
-        # HA core only supports state up to 255 chars; we keep full text separately.
-        self._attr_max = min(meta.get("max", 255), 255)
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Group tap text under a single 'Beer Tap List' device."""
-        return DeviceInfo(
-            identifiers={(DOMAIN, f"{self.entry.entry_id}_taplist")},
-            name="Beer Tap List",
-            manufacturer="Beer Keg",
-        )
-
-    # ---- Core value: short preview for Home Assistant state ----
-
-    @property
-    def native_value(self) -> str:
-        """Return a <=255 char preview; full text is in attributes.full_value."""
-        tap_cfg = self.state_ref.get(self.tap_id, {})
-        full_val = str(tap_cfg.get(self.field_key, "") or "")
-
-        # state preview (respect 255-char core limit)
-        return full_val[:255]
-
-    @property
-    def extra_state_attributes(self) -> Dict[str, Any]:
-        """Expose full_value so Lovelace cards can render the entire text."""
-        tap_cfg = self.state_ref.get(self.tap_id, {})
-        full_val = str(tap_cfg.get(self.field_key, "") or "")
-        return {
-            "full_value": full_val,
-        }
-
-    async def async_set_value(self, value: str) -> None:
-        """
-        Store full text (up to meta['max']) in tap_text, but keep
-        the entity state to a 255-char preview to avoid HA truncation
-        warnings.
-        """
-        domain_state = self.hass.data[DOMAIN][self.entry.entry_id]
-        tap_cfg = self.state_ref.setdefault(self.tap_id, {})
-
-        if value is None:
-            value = ""
-        value = str(value)
-
-        max_len = self.meta.get("max", 4096)
-        if max_len and len(value) > max_len:
-            value = value[:max_len]
-
-        tap_cfg[self.field_key] = value
-
-        # Persist everything (same bundle used by numbers/select/text)
-        prefs = domain_state.get("prefs_store")
-        if prefs:
-            await prefs.async_save(
-                {
-                    "display_units": domain_state.get("display_units", {}),
-                    "keg_config": domain_state.get("keg_config", {}),
-                    "tap_text": domain_state.get("tap_text", {}),
-                    "tap_numbers": domain_state.get("tap_numbers", {}),
-                    "noise_deadband_kg": domain_state.get("noise_deadband_kg"),
-                    "smoothing_alpha": domain_state.get("smoothing_alpha"),
-                }
-            )
-
-        # Nudge UI; we reuse PLATFORM_EVENT for simplicity
-        self.hass.bus.async_fire(
-            PLATFORM_EVENT,
-            {"tap": self.tap_id},
-        )
-        self.async_write_ha_state()
 
 
 # -------------------------------------------------------------------
@@ -515,6 +354,7 @@ class AirlockTextEntity(TextEntity):
         self.async_write_ha_state()
 
     async def async_added_to_hass(self) -> None:
+        self.hass.data[DOMAIN][self.entry.entry_id].setdefault("registered_unique_ids", set()).add(self._attr_unique_id)
         self.async_on_remove(self.hass.bus.async_listen(AIRLOCK_EVENT, self._on_event))
 
     @callback

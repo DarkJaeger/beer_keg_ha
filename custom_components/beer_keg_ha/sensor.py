@@ -208,8 +208,7 @@ class KegSensor(SensorEntity):
         self._state_ref: Dict[str, Any] = hass.data[DOMAIN][entry.entry_id]
         self._meta = SENSOR_TYPES[sensor_type]
 
-        short_id = keg_id[:4]
-        self._attr_name = f"Keg {short_id} {self._meta['name']}"
+        self._attr_name = self._meta['name']
         self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}_{keg_id}_{sensor_type}"
         self._attr_icon = self._meta.get("icon")
         self._attr_device_class = self._meta.get("device_class")
@@ -339,6 +338,7 @@ class KegSensor(SensorEntity):
         return raw
 
     async def async_added_to_hass(self) -> None:
+        self.hass.data[DOMAIN][self.entry.entry_id].setdefault("registered_unique_ids", set()).add(self._attr_unique_id)
         self.async_on_remove(self.hass.bus.async_listen(PLATFORM_EVENT, self._refresh_if_mine))
 
     @callback
@@ -368,6 +368,9 @@ class BeerKegDebugSensor(SensorEntity):
         self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}_debug"
         self._attr_name = "Beer Keg Debug"
         self._attr_icon = "mdi:bug"
+
+    async def async_added_to_hass(self) -> None:
+        self.hass.data[DOMAIN][self.entry.entry_id].setdefault("registered_unique_ids", set()).add(self._attr_unique_id)
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -437,6 +440,7 @@ class AirlockSensor(SensorEntity):
         return raw
 
     async def async_added_to_hass(self) -> None:
+        self.hass.data[DOMAIN][self.entry.entry_id].setdefault("registered_unique_ids", set()).add(self._attr_unique_id)
         self.async_on_remove(self.hass.bus.async_listen(AIRLOCK_EVENT, self._refresh_if_mine))
 
     @callback

@@ -231,6 +231,142 @@ keg_set_sensitivity:
           max: 10
           step: 1
 
+keg_reset_last_pour:
+  name: Reset Last Pour
+  description: POST /api/kegs/:id/reset-last-pour — clears the last pour value on the server
+  fields:
+    id:
+      name: Keg ID
+      required: false
+      selector:
+        text:
+
+keg_tare_release:
+  name: Tare Release
+  description: POST /api/kegs/:id/tare-release — release the tare pin
+  fields:
+    id:
+      name: Keg ID
+      required: false
+      selector:
+        text:
+
+keg_empty_keg:
+  name: Trigger Empty Keg Calibration
+  description: POST /api/kegs/:id/empty-keg — trigger empty keg calibration
+  fields:
+    id:
+      name: Keg ID
+      required: false
+      selector:
+        text:
+
+keg_empty_keg_release:
+  name: Release Empty Keg Calibration
+  description: POST /api/kegs/:id/empty-keg-release — release empty keg calibration pin
+  fields:
+    id:
+      name: Keg ID
+      required: false
+      selector:
+        text:
+
+keg_set_display_mode:
+  name: Set Display Mode
+  description: POST /api/kegs/:id/display-mode — set whether weight or percent is shown as the primary value
+  fields:
+    id:
+      name: Keg ID
+      required: false
+      selector:
+        text:
+    value:
+      name: Display mode
+      required: true
+      selector:
+        select:
+          options: [weight_primary, percent_primary]
+
+keg_set_co2_capacity:
+  name: Set CO2 Capacity
+  description: POST /api/kegs/:id/co2-capacity — set CO2 cylinder capacity
+  fields:
+    id:
+      name: Keg ID
+      required: false
+      selector:
+        text:
+    value:
+      name: Capacity (kg)
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 50
+          step: 0.01
+
+keg_set_og:
+  name: Set Original Gravity (OG)
+  description: POST /api/kegs/:id/og — store OG on the server
+  fields:
+    id:
+      name: Keg ID
+      required: false
+      selector:
+        text:
+    value:
+      name: Original gravity
+      required: true
+      selector:
+        number:
+          min: 0.9
+          max: 1.2
+          step: 0.001
+
+keg_set_fg:
+  name: Set Final Gravity (FG)
+  description: POST /api/kegs/:id/fg — store FG on the server
+  fields:
+    id:
+      name: Keg ID
+      required: false
+      selector:
+        text:
+    value:
+      name: Final gravity
+      required: true
+      selector:
+        number:
+          min: 0.9
+          max: 1.2
+          step: 0.001
+
+keg_compute_abv:
+  name: Compute ABV
+  description: POST /api/kegs/:id/abv — compute and store ABV from OG and FG
+  fields:
+    id:
+      name: Keg ID
+      required: false
+      selector:
+        text:
+    og:
+      name: Original gravity (OG)
+      required: true
+      selector:
+        number:
+          min: 0.9
+          max: 1.2
+          step: 0.001
+    fg:
+      name: Final gravity (FG)
+      required: true
+      selector:
+        number:
+          min: 0.9
+          max: 1.2
+          step: 0.001
+
 # ------------------------------------------------------------
 # Airlock services
 

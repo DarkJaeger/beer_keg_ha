@@ -154,6 +154,8 @@ class BeerKegDateEntity(DateEntity):
 
     async def async_added_to_hass(self) -> None:
         """Refresh when this keg is updated elsewhere."""
+        self.hass.data[DOMAIN][self.entry.entry_id].setdefault("registered_unique_ids", set()).add(self._attr_unique_id)
+
         @callback
         def _handle_update(event) -> None:
             if (event.data or {}).get("keg_id") == self.keg_id:

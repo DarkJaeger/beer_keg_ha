@@ -369,6 +369,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Airlock state
         "airlock_data": {},
         "airlock_raw": {},
+        "registered_unique_ids": set(),
     }
     hass.data[DOMAIN][entry.entry_id] = state
     session = async_get_clientsession(hass)
@@ -729,6 +730,78 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _register_service_once(hass, "keg_set_sensitivity", keg_set_sensitivity,
         schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.All(vol.Coerce(int), vol.Range(min=0, max=10))}))
 
+    async def keg_reset_last_pour(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if keg_id:
+            await _keg_post(keg_id, "reset-last-pour")
+
+    _register_service_once(hass, "keg_reset_last_pour", keg_reset_last_pour,
+        schema=vol.Schema({vol.Optional("id"): cv.string}))
+
+    async def keg_tare_release(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if keg_id:
+            await _keg_post(keg_id, "tare-release")
+
+    _register_service_once(hass, "keg_tare_release", keg_tare_release,
+        schema=vol.Schema({vol.Optional("id"): cv.string}))
+
+    async def keg_empty_keg(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if keg_id:
+            await _keg_post(keg_id, "empty-keg")
+
+    _register_service_once(hass, "keg_empty_keg", keg_empty_keg,
+        schema=vol.Schema({vol.Optional("id"): cv.string}))
+
+    async def keg_empty_keg_release(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if keg_id:
+            await _keg_post(keg_id, "empty-keg-release")
+
+    _register_service_once(hass, "keg_empty_keg_release", keg_empty_keg_release,
+        schema=vol.Schema({vol.Optional("id"): cv.string}))
+
+    async def keg_set_display_mode(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if keg_id:
+            await _keg_post(keg_id, "display-mode", {"value": str(call.data["value"])})
+
+    _register_service_once(hass, "keg_set_display_mode", keg_set_display_mode,
+        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.In(["weight_primary", "percent_primary"])}))
+
+    async def keg_set_co2_capacity(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if keg_id:
+            await _keg_post(keg_id, "co2-capacity", {"value": str(call.data["value"])})
+
+    _register_service_once(hass, "keg_set_co2_capacity", keg_set_co2_capacity,
+        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.Coerce(float)}))
+
+    async def keg_set_og(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if keg_id:
+            await _keg_post(keg_id, "og", {"value": str(call.data["value"])})
+
+    _register_service_once(hass, "keg_set_og", keg_set_og,
+        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.Coerce(float)}))
+
+    async def keg_set_fg(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if keg_id:
+            await _keg_post(keg_id, "fg", {"value": str(call.data["value"])})
+
+    _register_service_once(hass, "keg_set_fg", keg_set_fg,
+        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("value"): vol.Coerce(float)}))
+
+    async def keg_compute_abv(call: ServiceCall) -> None:
+        keg_id = _resolve_keg_id(call)
+        if keg_id:
+            await _keg_post(keg_id, "abv", {"og": str(call.data["og"]), "fg": str(call.data["fg"])})
+
+    _register_service_once(hass, "keg_compute_abv", keg_compute_abv,
+        schema=vol.Schema({vol.Optional("id"): cv.string, vol.Required("og"): vol.Coerce(float), vol.Required("fg"): vol.Coerce(float)}))
+
     # ── Airlock services ────────────────────────────────────────────────────
 
     _SCHEMA_SET_AIRLOCK_LABEL = vol.Schema({
@@ -858,6 +931,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         active_keg_ids = set(state.get("data", {}).keys())
         active_airlock_ids = set(state.get("airlock_data", {}).keys())
+        registered_uids = state.get("registered_unique_ids", set())
         prefix = f"{DOMAIN}_{entry.entry_id}_"
 
         removed = 0
@@ -867,14 +941,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             uid = reg_entry.unique_id or ""
 
-            # Case 1: no HA state at all (truly orphaned from old code)
-            if hass.states.get(reg_entry.entity_id) is None:
-                _LOGGER.info("%s: removing orphaned entity %s", DOMAIN, reg_entry.entity_id)
-                registry.async_remove(reg_entry.entity_id)
-                removed += 1
-                continue
-
-            # Case 2: entity is loaded but for a keg/airlock no longer on the server
             if not uid.startswith(prefix):
                 continue
             remainder = uid[len(prefix):]
@@ -900,6 +966,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         _LOGGER.info("%s: removing stale keg entity %s", DOMAIN, reg_entry.entity_id)
                         registry.async_remove(reg_entry.entity_id)
                         removed += 1
+                    continue
+
+            # Global/settings/debug entities: remove if not registered this session
+            # (registered_uids is non-empty once all platforms have loaded)
+            if registered_uids and uid not in registered_uids:
+                _LOGGER.info("%s: removing orphaned entity %s", DOMAIN, reg_entry.entity_id)
+                registry.async_remove(reg_entry.entity_id)
+                removed += 1
 
         if removed:
             _LOGGER.info("%s: cleanup removed %d stale entities", DOMAIN, removed)

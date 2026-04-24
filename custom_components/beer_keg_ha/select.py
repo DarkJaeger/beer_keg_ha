@@ -123,6 +123,7 @@ class BeerKegDeviceSelect(SelectEntity):
         self.async_write_ha_state()
 
     async def async_added_to_hass(self) -> None:
+        self.hass.data[DOMAIN][self.entry.entry_id].setdefault("registered_unique_ids", set()).add(self._attr_unique_id)
         # Initial options
         new_opts = self._read_devices()
         self._attr_options = new_opts
@@ -228,6 +229,7 @@ class AirlockTempUnitSelect(SelectEntity):
         self.async_write_ha_state()
 
     async def async_added_to_hass(self) -> None:
+        self.hass.data[DOMAIN][self.entry.entry_id].setdefault("registered_unique_ids", set()).add(self._attr_unique_id)
         self.async_on_remove(self.hass.bus.async_listen(AIRLOCK_EVENT, self._on_event))
 
     @callback

@@ -79,6 +79,7 @@ class _AirlockSwitchBase(SwitchEntity):
             _LOGGER.error("Airlock switch POST %s failed: %s", url, err)
 
     async def async_added_to_hass(self) -> None:
+        self.hass.data[DOMAIN][self.entry.entry_id].setdefault("registered_unique_ids", set()).add(self._attr_unique_id)
         self.async_on_remove(self.hass.bus.async_listen(AIRLOCK_EVENT, self._on_event))
 
     @callback
